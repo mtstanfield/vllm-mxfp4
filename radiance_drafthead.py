@@ -190,6 +190,65 @@ if triton is not None:
             acc += tl.load(X + m * K + offs).to(tl.float32) * wv
         tl.store(OUT + m * R + j, tl.sum(acc, axis=0))
 
+    # ---- local (2026-09-28 evening): fused draft head for the exact-set vocab path (RADIANCE_DRAFT_FUSED=1) ------------
+    # Same math as _draft_head_int2, minus the three launches around it: rows past the real m are masked instead of
+    # zero-padded (fill + cat), the per-group sums of x come from the tile the kernel already loads instead of a separate
+    # fp32 cast + reduce, and the coarse scores are not written at all (the exact set discards them).
+    @triton.jit
+    def _draft_head_int2_cand(X, Wq, S, ZS, BM, BI, m_rows, K: tl.constexpr, N, stride_wq, stride_s, NBLK,
+                              KC: tl.constexpr, G: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        pid = tl.program_id(0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_k = tl.arange(0, G)
+        mask_n = offs_n < N
+        mask_m = offs_m < m_rows
+        Q: tl.constexpr = K // 4
+        NG: tl.constexpr = Q // G
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for g in range(0, NG):
+            b16 = tl.load(Wq + offs_n[None, :] * stride_wq + (g * G + offs_k)[:, None],
+                          mask=mask_n[None, :], other=0).to(tl.uint16)
+            for q in tl.static_range(4):
+                if q < 3:
+                    wv = (((b16 << (5 - 2 * q)) & 0x60) | 0x3F80).to(tl.bfloat16, bitcast=True)
+                else:
+                    wv = (((b16 >> 1) & 0x60) | 0x3F80).to(tl.bfloat16, bitcast=True)
+                xv = tl.load(X + offs_m[:, None] * K + (q * Q + g * G + offs_k)[None, :],
+                             mask=mask_m[:, None], other=0.0).to(tl.bfloat16)
+                gi = q * NG + g
+                sv = tl.sum(xv.to(tl.float32), axis=1)
+                acc += tl.dot(xv, wv) * tl.load(S + offs_n * stride_s + gi,
+                                                mask=mask_n, other=0.0).to(tl.float32)[None, :]
+                acc -= sv[:, None] * tl.load(ZS + offs_n * stride_s + gi,
+                                             mask=mask_n, other=0.0).to(tl.float32)[None, :]
+        _emit(acc, mask_n, BM, BI, offs_m, pid, NBLK, KC, BLOCK_N)
+
+    @triton.jit
+    def _rerank_scatter(X, W, S, IDX, IDS, OUT, K: tl.constexpr, stride_w, NFULL, R: tl.constexpr,
+                        BLOCK_K: tl.constexpr, FP8: tl.constexpr):
+        """_rerank_exact writing its bf16 logit straight into the full-vocab row at IDS[candidate] (the rows around it
+        are -inf from one fill): replaces the -inf fill of the sub row, the cast, the scatter and the index_put."""
+        m = tl.program_id(0)
+        j = tl.program_id(1)
+        n = tl.load(IDX + m * R + j)
+        acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+        if FP8:
+            sc = tl.load(S + n).to(tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs = k0 + tl.arange(0, BLOCK_K)
+            if FP8:
+                b = tl.load(W + n * stride_w + offs).to(tl.int32)
+                e = (b >> 3) & 15
+                mant = (b & 7).to(tl.float32)
+                mag = tl.where(e == 0, mant * 0.001953125,
+                               (1.0 + mant * 0.125) * tl.exp2((e - 7).to(tl.float32)))
+                wv = tl.where((b & 128) != 0, -mag, mag) * sc
+            else:
+                wv = tl.load(W + n * stride_w + offs).to(tl.float32)
+            acc += tl.load(X + m * K + offs).to(tl.float32) * wv
+        tl.store(OUT + m.to(tl.int64) * NFULL + tl.load(IDS + n), tl.sum(acc, axis=0).to(tl.bfloat16))
+
 
 def _head_matrix(lm_head):
     """(rows [N, K], per-row scale [N] fp32 or None) for the head's weight. A compressed-tensors
@@ -412,7 +471,289 @@ def _quantize_head_now(lp, lm_head):
             f"({stored / 2**30:.2f} GiB/rank), {KCAND} cand/block, rerank top-{RERANK} exact")
 
 
+# ---- local (2026-09-27): pruned DRAFT vocabulary --------------------------------------------------------------------
+# RADIANCE_DRAFT_VOCAB=<file, one token id per line>: the MTP drafter scores only those rows -- the int2 coarse pass and
+# exact rerank above, run on the sub-matrix (a 48k list reads ~1/5 of the full int2 head) -- and every other entry of the
+# vocabulary row is -inf. Output cannot move: the target verifies with its own head; only acceptance can.
+VOCAB_FILE = os.environ.get("RADIANCE_DRAFT_VOCAB", "")
+
+
+class _SubHead:
+    """The rows the draft may propose, in the shape _head_matrix reads: [n_sub, K] rows (+ [n_sub, 1] scale)."""
+
+    def __init__(self, w, wsc):
+        self.weight = w
+        if wsc is not None:
+            self.weight_scale = wsc
+
+
+def _apply_head_vocab(self, lm_head, hidden_states, embedding_bias):
+    sub = self._dv_sub
+    if sub is None:
+        rows, rsc = _head_matrix(lm_head)
+        if rows is None or _head_is_empty(rows, rsc):
+            return type(self)._apply_head(self, lm_head, hidden_states, embedding_bias)
+        ids = self._dv_ids.to(rows.device)
+        sub = _SubHead(rows.index_select(0, ids).contiguous(),
+                       rsc.index_select(0, ids).reshape(-1, 1).contiguous() if rsc is not None else None)
+        status = _quantize_head_now(self, sub)          # rebinds _apply_head to the int2 path; take it back
+        self._apply_head = types.MethodType(_apply_head_vocab, self)
+        self._dv_sub, self._dv_ids_dev, self._dv_nfull = sub, ids, rows.shape[0]
+        sys.stderr.write(f"[radiance] DRAFT_VOCAB: {ids.numel()} of {rows.shape[0]} rows -> {status}\n")
+        sys.stderr.flush()
+    if FUSED and getattr(self, "_radiance_topk_only", False) and embedding_bias is None:
+        return _apply_vocab_fused(self, sub, hidden_states)
+    y_sub = _apply_head_int2(self, sub, hidden_states, embedding_bias)
+    y = torch.full((*y_sub.shape[:-1], self._dv_nfull), float("-inf"), dtype=y_sub.dtype, device=y_sub.device)
+    y[..., self._dv_ids_dev] = y_sub
+    return y
+
+
+# RADIANCE_DRAFT_FUSED=1 (local 2026-09-28 evening): the exact-set vocab path in 6 launches per draft call instead of 15
+# (int2 candidates, topk, sort, gather, one -inf fill, rerank-scatter). Output identical to the unfused path's: -inf
+# everywhere except the RERANK exactly scored candidates (bf16); the candidate SET can differ only where two coarse
+# scores tie to within the fp32 order of the in-kernel group sums. Drafts only.
+FUSED = os.environ.get("RADIANCE_DRAFT_FUSED", "0") == "1"
+
+
+def _apply_vocab_fused(self, sub, hidden_states):
+    x = hidden_states.reshape(-1, hidden_states.shape[-1])
+    if not x.is_contiguous():
+        x = x.contiguous()
+    m, k = x.shape
+    M = _pow2_at_least(m)
+    n, nblk = self._radiance_n, self._radiance_nblk
+    bm = torch.empty(M, nblk * KCAND, dtype=torch.float32, device=x.device)
+    bi = torch.empty(M, nblk * KCAND, dtype=torch.int32, device=x.device)
+    _draft_head_int2_cand[(nblk,)](
+        x, self._radiance_wq, self._radiance_scale, self._radiance_zs, bm, bi, m,
+        k, n, self._radiance_wq.stride(0), self._radiance_scale.stride(0), nblk, KCAND,
+        G=GROUP, BLOCK_M=M, BLOCK_N=BLOCK_N, **_cfg_for(M))
+    idx = bi.gather(1, bm.topk(RERANK, dim=1).indices).contiguous()
+    w, wsc = _head_matrix(sub)
+    nfull = self._dv_nfull
+    out = torch.full((m, nfull), float("-inf"), dtype=torch.bfloat16, device=x.device)
+    if wsc is not None:
+        _rerank_scatter[(m, RERANK)](x, w.view(torch.uint8), wsc, idx, self._dv_ids_dev, out, k, w.stride(0), nfull,
+                                     R=RERANK, BLOCK_K=512, FP8=True, num_warps=4)
+    else:
+        _rerank_scatter[(m, RERANK)](x, w, x, idx, self._dv_ids_dev, out, k, w.stride(0), nfull, R=RERANK,
+                                     BLOCK_K=512, FP8=False, num_warps=4)
+    if self.head_dtype is not None and self.head_dtype != out.dtype:
+        out = out.to(self.head_dtype)
+    return out.reshape(*hidden_states.shape[:-1], -1)
+
+
+def _install_vocab():
+    ids = sorted({int(t) for t in open(VOCAB_FILE).read().split()})
+    ids_t = torch.tensor(ids, dtype=torch.long)
+    for mod_name, cls_name in (("vllm.model_executor.models.qwen3_5_mtp", "Qwen3_5MTP"),
+                               ("vllm.model_executor.models.qwen3_next_mtp", "Qwen3NextMTP")):
+        try:
+            cls = getattr(__import__(mod_name, fromlist=[cls_name]), cls_name)
+        except Exception:
+            continue
+        if getattr(cls, "_radiance_vocab_wrapped", False):
+            continue
+        orig = cls.load_weights
+
+        def wrapped(self, weights, _orig=orig):
+            loaded = _orig(self, weights)
+            lp = getattr(self, "logits_processor", None)
+            if lp is None:
+                sys.stderr.write("[radiance] DRAFT_VOCAB: drafter has no logits_processor, full head kept\n")
+            else:
+                lp._dv_ids, lp._dv_sub = ids_t, None
+                lp._apply_head = types.MethodType(_apply_head_vocab, lp)   # sub-head built on first real call
+                if EXACT_SET:
+                    lp._radiance_topk_only = True
+            return loaded
+
+        cls.load_weights = wrapped
+        cls._radiance_vocab_wrapped = True
+    sys.stderr.write(f"[radiance] draft vocab armed: {len(ids)} ids from {VOCAB_FILE}"
+                     f"{', exact-reranked set only' if EXACT_SET else ''}\n")
+    sys.stderr.flush()
+
+
+# ---- local (2026-09-27): draft distribution for SAMPLED requests ---------------------------------------------------
+# vLLM's probabilistic drafting (draft_sample_method=probabilistic) applies only the temperature to the draft
+# ("we ignore most of the sampling parameters"), while the target keeps just the request's top-k/top-p set -- so every
+# unit of draft mass outside that set is a guaranteed rejection.
+#   RADIANCE_DRAFT_TOPKP=1     draft rows take temperature -> top-k -> top-p (the target sampler's order) before the
+#                              softmax, through the same apply_top_k_top_p the target uses.
+#   RADIANCE_DRAFT_EXACTSET=1  only the exactly reranked candidates are eligible (the rest of the int2 row is coarse 2-bit
+#                              scores; argmax never sees them, a sampled draft does).
+# Lossless either way: the drafted token is sampled from exactly the probs tensor handed to the rejection sampler, and
+# standard rejection sampling returns the target distribution for ANY such proposal. Only acceptance can move.
+DRAFT_TOPKP = os.environ.get("RADIANCE_DRAFT_TOPKP", "0") == "1"
+EXACT_SET = os.environ.get("RADIANCE_DRAFT_EXACTSET", "0") == "1"
+
+
+def _install_draft_topkp():
+    import vllm.v1.spec_decode.llm_base_proposer as lbp
+    from vllm.v1.sample.ops.topk_topp_sampler import (apply_top_k_top_p, empty_exponential_noise_like,
+                                                      sample_with_exponential_noise)
+    from vllm.v1.sample.sampler import _SAMPLING_EPS
+    if getattr(lbp, "_radiance_topkp", False):
+        return
+    orig = lbp.compute_probs_and_sample_next_token
+
+    def compute_probs_and_sample_next_token(logits, sampling_metadata, use_fp64_gumbel=False):
+        md = sampling_metadata
+        if md.all_greedy or (md.top_k is None and md.top_p is None):
+            return orig(logits, md, use_fp64_gumbel)
+        rows = logits.shape[0]
+
+        def per_row(t):      # parallel drafting has K rows per request (the caller did this for temperature only)
+            return t if t is None or t.shape[0] == rows else t.repeat_interleave(rows // t.shape[0], dim=0)
+
+        temperature = per_row(md.temperature)
+        if not md.all_random:
+            is_greedy = temperature < _SAMPLING_EPS
+            temperature = torch.where(is_greedy, 1.0, temperature)
+        logits.div_(temperature.view(-1, 1))
+        logits = apply_top_k_top_p(logits, per_row(md.top_k), per_row(md.top_p),
+                                   max_top_k=getattr(md, "max_top_k", 0))
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        noise = empty_exponential_noise_like(probs, use_fp64_gumbel)
+        noise.exponential_()
+        next_token_ids = sample_with_exponential_noise(probs.clone(), noise)
+        if not md.all_random:
+            next_token_ids = torch.where(is_greedy, probs.argmax(dim=-1), next_token_ids)
+        return next_token_ids, probs
+
+    lbp.compute_probs_and_sample_next_token = compute_probs_and_sample_next_token
+    lbp._radiance_topkp = True
+    sys.stderr.write("[radiance] draft top-k/top-p armed: sampled drafts use the request's truncation\n")
+    sys.stderr.flush()
+
+
+_TOPKP_KCAP = 64
+
+
+def _draft_mask(logits, k, p, temp):
+    """Capturable top-k/top-p over a top-64 window (fixed shapes, no host sync). Rows whose top-k is not a real cap
+    <= 64, and greedy rows, pass through untouched -- any proposal is lossless, the mask only has to be sampled from."""
+    vals, idx = torch.topk(logits, _TOPKP_KCAP, dim=-1)
+    kk = k.to(torch.long).clamp(1, _TOPKP_KCAP)
+    thr = vals.gather(1, kk.unsqueeze(1) - 1)
+    kept = vals >= thr
+    t = torch.where(temp > 0, temp, torch.ones_like(temp)).unsqueeze(1)
+    w = torch.where(kept, vals.float() / t, torch.full_like(t, float("-inf")))
+    probs = w.softmax(dim=-1)
+    maskp = (probs.cumsum(dim=-1) - probs) >= p.unsqueeze(1)     # same rule as the target's composite top-p
+    out = torch.full_like(logits, float("-inf"))
+    out.scatter_(1, idx, torch.where(kept & ~maskp, vals, torch.full_like(vals, float("-inf"))))
+    ok = ((k <= _TOPKP_KCAP) & (temp > 0)).unsqueeze(1)
+    return torch.where(ok, out, logits)
+
+
+def _install_draft_topkp_v2():
+    """The V2 model runner (vLLM 0.29 default) drafts in v1/worker/gpu/spec_decode: gumbel_sample on the draft logits
+    at the request temperature, the PRE-temperature logits cached for the rejection sampler's q. Mask those logits
+    before both, so the draw and the cached q are the same truncated distribution. Runs inside the captured draft
+    graphs, so top-k/top-p are copied into speculator-owned buffers outside them (as the stock code does for
+    temperature) -- the sampler's UVA arrays are re-pointed on every update and cannot be captured."""
+    from vllm.v1.worker.gpu.spec_decode import speculator as spm
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+    from vllm.v1.worker.gpu import model_runner as mrm
+    S, R = spm.DraftModelSpeculator, mrm.GPUModelRunner
+    if getattr(S, "_radiance_topkp", False):
+        return
+    orig_load, orig_copy, orig_sample = R.load_model, S._copy_request_inputs, S.sample_draft
+
+    def load_model(self, *args, **kwargs):
+        out = orig_load(self, *args, **kwargs)
+        spec, smp = getattr(self, "speculator", None), getattr(self, "sampler", None)
+        if isinstance(spec, S) and smp is not None and getattr(spec, "draft_logits", None) is not None:
+            st_ = smp.sampling_states
+            spec._rad_states = st_
+            spec._rad_topk = torch.full((spec.max_num_reqs,), st_.vocab_size, dtype=torch.int32, device=spec.temperature.device)
+            spec._rad_topp = torch.ones(spec.max_num_reqs, dtype=torch.float32, device=spec.temperature.device)
+            sys.stderr.write("[radiance] draft top-k/top-p live on the V2 speculator\n")
+            sys.stderr.flush()
+        return out
+
+    def _copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
+        orig_copy(self, num_reqs, idx_mapping, temperature, seeds)
+        st_ = getattr(self, "_rad_states", None)
+        if st_ is not None:
+            self._rad_topk.copy_(st_.top_k.gpu[:self.max_num_reqs])
+            self._rad_topp.copy_(st_.top_p.gpu[:self.max_num_reqs])
+
+    def sample_draft(self, hidden_states, sample_src_positions, idx_mapping, temperature, seeds, draft_step,
+                     draft_logits):
+        if draft_logits is None or getattr(self, "_rad_states", None) is None:
+            return orig_sample(self, hidden_states, sample_src_positions, idx_mapping, temperature, seeds,
+                               draft_step, draft_logits)
+        logits = self.model.compute_logits(hidden_states)
+        rows = idx_mapping.clamp(min=0).long()
+        logits = _draft_mask(logits, self._rad_topk[rows], self._rad_topp[rows], temperature[rows].float())
+        return gumbel_sample(logits, idx_mapping, temperature, seeds, sample_src_positions, apply_temperature=True,
+                             is_drafting=True, logits_cache=draft_logits, logits_cache_col=draft_step,
+                             use_fp64=self.use_fp64_gumbel)
+
+    R.load_model = load_model
+    S._copy_request_inputs = _copy_request_inputs
+    S.sample_draft = sample_draft
+    S._radiance_topkp = True
+    sys.stderr.write("[radiance] draft top-k/top-p armed (V2 runner)\n")
+    sys.stderr.flush()
+
+
+def _install_tunable_diag():
+    """RADIANCE_TUNABLE_DIAG=1 (local, diagnostic): after the V2 runner loads the model, print TunableOp's live state in
+    the ENGINE process and time the MTP down-projection shape (17408x5120 fp8 rowwise, M=1) there."""
+    from vllm.v1.worker.gpu import model_runner as mrm
+    R = mrm.GPUModelRunner
+    orig = R.load_model
+
+    def load_model(self, *args, **kwargs):
+        out = orig(self, *args, **kwargs)
+        try:
+            t = torch.cuda.tunable
+            msg = (f"enabled={t.is_enabled()} tuning={t.tuning_is_enabled()} file={t.get_filename()} "
+                   f"results={len(t.get_results())}")
+            w = (torch.randn(5120, 17408, device="cuda") * 0.05).to(torch.float8_e4m3fn)
+            x = torch.randn(1, 17408, device="cuda").to(torch.float8_e4m3fn)
+            sa, sb = torch.ones(1, 1, device="cuda"), torch.ones(1, 5120, device="cuda")
+            f = lambda: torch._scaled_mm(x, w.t(), scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+            for _ in range(5):
+                f()
+            torch.cuda.synchronize()
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            for _ in range(20):
+                f()
+            e1.record()
+            torch.cuda.synchronize()
+            msg += f" | down 17408x5120 M=1: {e0.elapsed_time(e1) * 1000 / 20:.0f} us (tuned ~170, default ~310)"
+            del w
+        except Exception as e:
+            msg = f"diag failed: {e!r}"
+        sys.stderr.write(f"[radiance.tunablediag] {msg}\n")
+        sys.stderr.flush()
+        return out
+
+    R.load_model = load_model
+
+
 def install():
+    if os.environ.get("RADIANCE_TUNABLE_DIAG", "0") == "1":
+        try:
+            _install_tunable_diag()
+        except Exception as e:
+            sys.stderr.write(f"[radiance] tunable diag install failed: {e!r}\n")
+    if DRAFT_TOPKP:
+        for f in (_install_draft_topkp, _install_draft_topkp_v2):
+            try:
+                f()
+            except Exception as e:             # never cost the vocab/int2 install below
+                sys.stderr.write(f"[radiance] {f.__name__} failed (stock draft sampling there): {e!r}\n")
+    if VOCAB_FILE and triton is not None:
+        _install_vocab()
+        return
     if not FAST:
         # stock bf16 head; nothing patched, nothing quantised
         return

@@ -98,6 +98,17 @@ _FUSED_UPDATE_NARROW = {
                            head_k=HEAD_K, head_v=HEAD_V)
     for dt, (tag, frag) in _STATE_TAGS.items()
 }
+# local (2026-09-27): the chunked PREFILL scan on the 16-bit ssm cache -- libr4d rx9x only (exact decay, 16-bit
+# initial/final state, fp32 inside). Without it an fp16 cache sends every prefill GDN layer to FLA. A build without
+# the entry point fails the name check above and leaves this empty. RADIANCE_GDN_SCAN_NARROW=0 forces FLA (A/B).
+_SCAN_NARROW = os.environ.get("RADIANCE_GDN_SCAN_NARROW", "1") == "1"
+# local (2026-09-27): RADIANCE_GDN_SCAN_OFF=1 makes fused_prefill decline every call, i.e. prefill GDN runs FLA
+# with whatever state dtype -- the reference arm for A/B-ing the libr4d chunk scan (default 0: no change).
+_SCAN_OFF = os.environ.get("RADIANCE_GDN_SCAN_OFF", "0") == "1"
+_CHUNK_SCAN_NARROW = {
+    dt: _bind_narrow_state("gdn_chunk_scan", tag, frag, head_k=HEAD_K, head_v=HEAD_V, chunk=CHUNK)
+    for dt, (tag, frag) in _STATE_TAGS.items()
+} if _SCAN_NARROW else {}
 # RADIANCE_GDN_LAZY=1 (radiance_gdn_lazy.py): one base state per sequence plus a candidate stash
 # instead of a snapshot per candidate. Needs libr4d rx10+ (gdn_lazy_update) and patch_gdn_lazy.py,
 # which makes the allocator hand out ONE speculative block. Under it the spec window is two
@@ -208,6 +219,8 @@ def fused_prefill(q, k, v, A, g, beta, scale, initial_state, output_final_state,
     """
     if cu_seqlens is None:
         return _bail("no cu_seqlens (the kernel is varlen-only)")
+    if _SCAN_OFF:
+        return _bail("RADIANCE_GDN_SCAN_OFF")
     if initial_state is None or not output_final_state:
         return _bail("the kernel always reads an initial state and writes a final one")
     if q.shape[0] != 1 or q.shape[-1] != HEAD_K or v.shape[-1] != HEAD_V:
@@ -219,8 +232,11 @@ def fused_prefill(q, k, v, A, g, beta, scale, initial_state, output_final_state,
         return _bail(f"dtypes q {q.dtype} k {k.dtype} v {v.dtype} A {A.dtype}")
     if g.dtype != torch.float32 or beta.dtype != torch.float32:
         return _bail(f"gate dtypes g {g.dtype} beta {beta.dtype}")
+    scan = _CHUNK_SCAN
     if initial_state.dtype != torch.float32:
-        return _bail(f"state dtype {initial_state.dtype}")
+        scan = _CHUNK_SCAN_NARROW.get(initial_state.dtype)      # local: rx9x 16-bit-state scan
+        if scan is None:
+            return _bail(f"state dtype {initial_state.dtype}")
     # Every tensor is indexed by raw stride arithmetic, so a non-contiguous view would be read wrong
     # rather than slowly.
     for name, t in (("q", q), ("k", k), ("v", v), ("A", A), ("g", g), ("beta", beta),
@@ -255,7 +271,7 @@ def fused_prefill(q, k, v, A, g, beta, scale, initial_state, output_final_state,
         o = torch.empty_like(v)
     final_state = torch.empty_like(initial_state)
 
-    _CHUNK_SCAN(
+    scan(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), A.data_ptr(), g.data_ptr(), beta.data_ptr(),
         initial_state.data_ptr(), o.data_ptr(), final_state.data_ptr(), cu_seqlens.data_ptr(),
         num_seqs, H, Hg, HEAD_K, HEAD_V, CHUNK, float(scale),
@@ -514,6 +530,9 @@ def _plan(self, mixed_qkv, b, a, core_attn_out):
             raise RuntimeError(f"radiance_gdn: lazy mode cannot decline a spec step: {why}")
         _fb(why)
         return None
+
+    if _SCAN_OFF:                       # local: the whole layer takes the stock (FLA) path
+        return no("RADIANCE_GDN_SCAN_OFF")
 
     md = _metadata(self)
     if md is None:

@@ -354,6 +354,57 @@ class R4DAttentionImpl(TritonAttentionImpl):
         # The kernels write bf16. Let the fusion pass quantise the output separately.
         return False
 
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if _KV_STATS and key is not None and key.shape[0] >= 256 \
+                and not torch.cuda.is_current_stream_capturing():
+            _kv_census(self, layer, key, value)
+        return super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+
+
+# ---- local (2026-09-27): K/V magnitude census against the fp8 e4m3 cache ------------------------------------------
+# RADIANCE_KV_STATS=<tokens>: per attention layer, once that many PREFILL tokens have been written (eager steps only,
+# never inside a graph capture), print where K and V sit in e4m3's range and what the cache's round trip costs: at the
+# layer's current scale, and at an amax-calibrated per-tensor scale (amax -> 448) -- the lever the cache already has.
+_KV_STATS = int(os.environ.get("RADIANCE_KV_STATS", "0") or 0)
+_KV_ACC: dict = {}
+
+
+def _e4m3_rt(x, s):
+    return (x / s).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float() * s
+
+
+def _kv_census(impl, layer, key, value):
+    name = getattr(layer, "layer_name", None) or f"attn@{id(layer):x}"
+    acc = _KV_ACC.setdefault(name, {"n": 0, "done": False, "k": [], "v": []})
+    if acc["done"]:
+        return
+    acc["n"] += key.shape[0]
+    for tag, x in (("k", key), ("v", value)):
+        xf = x.float().reshape(-1)
+        idx = torch.randint(0, xf.numel(), (min(xf.numel(), 1 << 20),), device=xf.device)
+        acc[tag].append(xf[idx])                              # a uniform sample keeps the census cheap
+    if acc["n"] < _KV_STATS:
+        return
+    acc["done"] = True
+    parts = []
+    for tag, scale in (("K", float(getattr(layer, "_k_scale_float", 1.0))),
+                       ("V", float(getattr(layer, "_v_scale_float", 1.0)))):
+        x = torch.cat(acc[tag.lower()])
+        ax = x.abs()
+        amax = float(ax.max())
+        nrm = float(x.norm())
+        e_cur = float((x - _e4m3_rt(x, scale)).norm()) / nrm
+        s_cal = max(amax / 448.0, 1e-12)
+        e_cal = float((x - _e4m3_rt(x, s_cal)).norm()) / nrm
+        parts.append(f"{tag}: amax {amax:.3g} p50|x| {float(ax.median()):.3g} "
+                     f"<2^-6 {100 * float((ax / scale < 2 ** -6).float().mean()):.1f}% "
+                     f"<2^-10 {100 * float((ax / scale < 2 ** -10).float().mean()):.1f}% "
+                     f">448 {100 * float((ax / scale > 448).float().mean()):.2f}% | e4m3 relerr scale {scale:g}: "
+                     f"{e_cur:.4f}, calibrated {s_cal:.3g}: {e_cal:.4f}")
+    acc["k"], acc["v"] = [], []
+    sys.stderr.write(f"[radiance.kvstats] {name} ({acc['n']} tokens) " + " || ".join(parts) + "\n")
+    sys.stderr.flush()
+
     def _geometry(self, kv_cache: torch.Tensor, query: torch.Tensor, out: torch.Tensor) -> tuple:
         """Variant index and cache strides, checked once and then reused for the layer's life."""
         if self._kv_geometry is None:

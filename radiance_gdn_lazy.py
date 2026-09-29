@@ -36,13 +36,18 @@ class _Tables:
     def __init__(self, ctx, kv_cache_config, forward_context):
         import radiance_gdn
         from vllm.model_executor.layers.mamba.mamba_utils import get_temporal_copy_spec
-        copy_funcs = tuple(ctx._radiance_copy_funcs)
+        _cf = ctx._radiance_copy_funcs  # tuple per state (<=0.27) or {mamba_type: tuple} (0.29)
+        copy_funcs = None if isinstance(_cf, dict) else tuple(_cf)
         ptrs, strides, groups, alogs, dtbs = [], [], [], [], []
         self.keep = []                       # the fp32 gate copies must outlive the tables
         geom = None
         for g_local, gid in enumerate(ctx.mamba_group_ids):
             for name in kv_cache_config.kv_cache_groups[gid].layer_names:
                 layer = forward_context[name]
+                if isinstance(_cf, dict):
+                    from vllm.v1.worker.mamba_utils import _get_mamba_spec_for_layer
+                    copy_funcs = _cf[_get_mamba_spec_for_layer(
+                        kv_cache_config.kv_cache_groups[gid], name).mamba_type]
                 a_log, dt_bias = radiance_gdn._gate_params(layer)
                 self.keep.append((a_log, dt_bias))
                 for st_idx, state in enumerate(layer.kv_cache):

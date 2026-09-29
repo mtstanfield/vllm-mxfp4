@@ -1,0 +1,4 @@
+#!/bin/bash
+# Unraid has no host python3; serve-mxfp4.sh (fork >= 2026-09-16) runs tiny python3 -c one-liners on the host (HIP id mapping).
+# Run them with the image's interpreter instead. Only on PATH inside deploy-vllm-qwen38-next.sh.
+exec docker run --rm -i --entrypoint python3 stilldeadcode/vllm-radiance:0.9.3 "$@"

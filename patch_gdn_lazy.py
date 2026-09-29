@@ -13,21 +13,34 @@ Three source patches, every one of them inert unless the env knob is set at runt
 import sysconfig
 from pathlib import Path
 
-from _patchlib import apply
+from _patchlib import apply, apply_any  # radiance 0.29 shapes
 
 SP = Path(sysconfig.get_paths()["purelib"]) / "vllm"
 SENT = "radiance lazy gdn"
 
 # ---- 1. spec blocks -------------------------------------------------------------------------
-apply(SP / "model_executor/layers/mamba/abstract.py",
-'''            num_speculative_blocks=(
+apply_any(SP / "model_executor/layers/mamba/abstract.py", [
+('''            num_speculative_blocks=(
                 vllm_config.speculative_config.num_speculative_tokens
                 if vllm_config.speculative_config
                 else 0
             ),
 ''',
 '''            num_speculative_blocks=_radiance_lazy_spec_blocks(self, vllm_config),  # radiance lazy gdn
-''', SENT, "abstract.get_kv_cache_spec: one stash block under RADIANCE_GDN_LAZY")
+'''),
+('''            num_speculative_blocks=(
+                0
+                if vllm_config.cache_config.use_kda_recoverssm
+                else vllm_config.num_speculative_tokens
+            ),
+''',
+'''            num_speculative_blocks=(
+                0
+                if vllm_config.cache_config.use_kda_recoverssm
+                else _radiance_lazy_spec_blocks(self, vllm_config)  # radiance lazy gdn
+            ),
+'''),
+], SENT, "abstract.get_kv_cache_spec: one stash block under RADIANCE_GDN_LAZY")
 apply(SP / "model_executor/layers/mamba/abstract.py",
 '''class MambaBase(AttentionLayerBase):''',
 '''def _radiance_lazy_spec_blocks(layer, vllm_config):
@@ -85,8 +98,8 @@ apply(G,
 
 # ---- 3. copies -------------------------------------------------------------------------------
 M = SP / "v1/worker/mamba_utils.py"
-apply(M,
-'''    # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
+apply_any(M, [
+('''    # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
     # the post-step new_num_computed value (V2 supplies the advanced count).
     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
 ):
@@ -96,7 +109,15 @@ apply(M,
     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
     LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn: temporal states are materialised elsewhere
 ):
-''', SENT + " post-sig", "mamba_utils: LAZY_TEMPORAL on the postprocess kernel")
+'''),
+('''    PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
+    # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
+''',
+'''    PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
+    LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn: temporal states are materialised elsewhere
+    # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
+'''),
+], SENT + " post-sig", "mamba_utils: LAZY_TEMPORAL on the postprocess kernel")
 apply(M,
 '''    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
     _copy_mamba_state_block(
@@ -107,8 +128,8 @@ apply(M,
     bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
     _copy_mamba_state_block(
 ''', SENT + " post-skip", "mamba_utils: postprocess skips temporal states under lazy")
-apply(M,
-'''    CONV_STATE_DIM_FIRST: tl.constexpr,
+apply_any(M, [
+('''    CONV_STATE_DIM_FIRST: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr = True,
 ):
     """Pre-copy mamba "align" state across block boundaries.
@@ -118,7 +139,15 @@ apply(M,
     LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn
 ):
     """Pre-copy mamba "align" state across block boundaries.
-''', SENT + " pre-sig", "mamba_utils: LAZY_TEMPORAL on the precopy kernel")
+'''),
+('''    HAS_IDX_MAPPING: tl.constexpr = True,
+    # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
+''',
+'''    HAS_IDX_MAPPING: tl.constexpr = True,
+    LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn
+    # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
+'''),
+], SENT + " pre-sig", "mamba_utils: LAZY_TEMPORAL on the precopy kernel")
 apply(M,
 '''    token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
@@ -140,8 +169,8 @@ apply(M,
         token_bias,
 ''', SENT + " pre-skip", "mamba_utils: precopy skips temporal states under lazy")
 # remember what the tables need
-apply(M,
-'''        if self.is_initialized:
+apply_any(M, [
+('''        if self.is_initialized:
             return
 
         idx = 0
@@ -156,7 +185,22 @@ apply(M,
 
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
-''', SENT + " tables", "mamba_utils: keep the forward context for the lazy tables")
+'''),
+('''        if self.is_initialized:
+            return
+        # This only runs once per worker.
+        with gpu_sync_allowed():
+''',
+'''        if self.is_initialized:
+            return
+        # radiance lazy gdn: the materialize tables are built from these on first use
+        self._radiance_kv_cfg = kv_cache_config
+        self._radiance_fwd_ctx = forward_context
+        self._radiance_copy_funcs = mamba_state_copy_funcs
+        # This only runs once per worker.
+        with gpu_sync_allowed():
+'''),
+], SENT + " tables", "mamba_utils: keep the forward context for the lazy tables")
 # V1 postprocess: not supported under lazy
 apply(M,
 '''        if num_reqs == 0 or not self.is_initialized:
@@ -172,8 +216,8 @@ apply(M,
         # Initialize output to current values (unchanged unless src==dst)
 ''', SENT + " v1", "mamba_utils: V1 postprocess refuses lazy")
 # precopy: Triton (conv only) then materialize
-apply(M,
-'''            idx_mapping,
+apply_any(M, [
+('''            idx_mapping,
             num_reqs,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
@@ -191,9 +235,23 @@ apply(M,
             import radiance_gdn_lazy
             radiance_gdn_lazy.materialize(self, 0, num_reqs, state_idx_gpu, src_col_gpu,
                                           token_bias_gpu, idx_mapping)
-''', SENT + " precopy", "mamba_utils: lazy materialize after the precopy")
-apply(M,
-'''        if num_reqs == 0 or not self.is_initialized:
+'''),
+('''            HAS_IDX_MAPPING=idx_mapping is not None,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
+        )
+''',
+'''            HAS_IDX_MAPPING=idx_mapping is not None,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
+            LAZY_TEMPORAL=_radiance_lazy(),
+        )
+        if _radiance_lazy():  # radiance lazy gdn: temporal migration = base + replay
+            import radiance_gdn_lazy
+            radiance_gdn_lazy.materialize(self, 0, num_reqs, state_idx_gpu, src_col_gpu,
+                                          token_bias_gpu, idx_mapping)
+'''),
+], SENT + " precopy", "mamba_utils: lazy materialize after the precopy")
+apply_any(M, [
+('''        if num_reqs == 0 or not self.is_initialized:
             return
         total_states = self.num_layers * self.num_state_types
         grid = (num_reqs, total_states)
@@ -214,9 +272,20 @@ apply(M,
             num_accepted_tokens_gpu,
             state_idx_gpu,
             None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
-''', SENT + " postalign", "mamba_utils: lazy materialize before the align postprocess")
-apply(M,
-'''            HAS_IDX_MAPPING=True,
+'''),
+('''        # V2 reads non-contiguous idx_mapping positions, so snapshot the whole
+        # decision buffer rather than only [:num_reqs].
+''',
+'''        if _radiance_lazy():  # radiance lazy gdn: checkpoint = base + replay, BEFORE the reset
+            import radiance_gdn_lazy
+            radiance_gdn_lazy.materialize(self, 1, num_reqs, num_accepted_tokens_gpu,
+                                          state_idx_gpu, new_num_computed_tokens_gpu, idx_mapping)
+        # V2 reads non-contiguous idx_mapping positions, so snapshot the whole
+        # decision buffer rather than only [:num_reqs].
+'''),
+], SENT + " postalign", "mamba_utils: lazy materialize before the align postprocess")
+apply_any(M, [
+('''            HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
         )
 ''',
@@ -224,9 +293,21 @@ apply(M,
             PRECOMPUTED_NEW_COMPUTED=True,
             LAZY_TEMPORAL=_radiance_lazy(),
         )
-''', SENT + " postalign-flag", "mamba_utils: LAZY_TEMPORAL on the align postprocess launch")
-apply(M,
-'''def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:''',
+'''),
+('''            HAS_IDX_MAPPING=True,
+            PRECOMPUTED_NEW_COMPUTED=True,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
+        )
+''',
+'''            HAS_IDX_MAPPING=True,
+            PRECOMPUTED_NEW_COMPUTED=True,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
+            LAZY_TEMPORAL=_radiance_lazy(),
+        )
+'''),
+], SENT + " postalign-flag", "mamba_utils: LAZY_TEMPORAL on the align postprocess launch")
+apply_any(M, [
+('''def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:''',
 '''def _radiance_lazy() -> bool:
     """radiance lazy gdn: RADIANCE_GDN_LAZY=1 (read once)."""
     import os as _os
@@ -236,5 +317,17 @@ apply(M,
     return v
 
 
-def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:''', SENT + " flag", "mamba_utils: lazy flag helper")
+def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:'''),
+('''def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int]]:''',
+'''def _radiance_lazy() -> bool:
+    """radiance lazy gdn: RADIANCE_GDN_LAZY=1 (read once)."""
+    import os as _os
+    v = getattr(_radiance_lazy, "_v", None)
+    if v is None:
+        v = _radiance_lazy._v = _os.environ.get("RADIANCE_GDN_LAZY", "0") == "1"
+    return v
+
+
+def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int]]:'''),
+], SENT + " flag", "mamba_utils: lazy flag helper")
 print("patch_gdn_lazy: done")

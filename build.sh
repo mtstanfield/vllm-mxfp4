@@ -117,7 +117,7 @@ if [ "$WANT_BASE" != 1 ] && [ -z "$BASE_DIGEST" ]; then
   if ! [[ "$BASE_DIGEST" =~ ^[a-f0-9]{64}$ ]]; then
     echo "NOTE: no manifest digest readable for ${BASE_REPO}:${BASE_TAG}; using the recipe's default pin" >&2
   else
-    DEFPIN=$(grep -m1 -oP 'ARG BASE_DIGEST=\K[0-9a-f]{64}' $DF)
+    DEFPIN=$(grep -m1 -oP 'ARG BASE_DIGEST=\K[0-9a-f]{64}' $DF || true)   # local fix: no pinned digest in Dockerfile.ggz14; grep exit 1 killed --full under set -e
     [ -n "$DEFPIN" ] && [ "$DEFPIN" != "$BASE_DIGEST" ] && \
       echo "NOTE: the published base has moved since the recipe was written (default pin ${DEFPIN} != live ${BASE_DIGEST}); building against the live base"
   fi

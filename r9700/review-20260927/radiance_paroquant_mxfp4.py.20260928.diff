@@ -1,0 +1,243 @@
+--- paroquant/radiance_paroquant_mxfp4.py.bak-20260928	2026-09-28 00:57:17.218939740 -0400
++++ paroquant/radiance_paroquant_mxfp4.py	2026-09-28 14:31:08.144149340 -0400
+@@ -57,6 +57,127 @@
+ # One GEMM launch per merged linear (partition select by n-block in the kernel) instead of one per
+ # rotated partition plus an output cat (default on; 0 = the per-partition loop, kept for A/Bs).
+ SINGLE_LAUNCH = os.environ.get("RADIANCE_PQM_SINGLE_LAUNCH", "1") == "1"
++# local (2026-09-28): RADIANCE_PQM_ROT3=1 -- above the decode band the per-token producers run the conflict-free
++# multi-row kernels (par_kernels_mr3.h: codes/scales byte-identical to the stock ones; mr_check.py measures -36% on the
++# norm-fed rotate+quant at M=8192). Their ownership-layout tables are built once per linear at load (build_rot3,
++# ~10 ms each) and looked up by the rec tensor's address inside the opaque op bodies, so no op signature (compiled
++# graph) changes. RADIANCE_PQM_SKIP_HS=1 also drops the stream producers' bf16 HS write, which
++# paroquant_mxfp4_linear_pre never reads.
++ROT3 = os.environ.get("RADIANCE_PQM_ROT3", "0") == "1" and hasattr(_pqk, "launch_rotate_tokquant3_mr")
++SKIP_HS = ROT3 and os.environ.get("RADIANCE_PQM_SKIP_HS", "0") == "1"
++# The stream-2 (ew) producers on the conflict-free core are opt-in: RADIANCE_PQM_ROT3_EW=1. 2026-09-28: boots of the
++# GDN no-copy / EMPTY_OUT configs hit a GPU memory fault inside pq_ew_rot_tok3_mr<2,...> (GDN gated norm) during the
++# profile run -- 4 of 5 boots, never on the configs without those switches, kernel gate (mr_check) clean, root cause not
++# isolated. The ew variants are ~equal to stock anyway (mr_check: ew0 -8% with SKIP_HS, ew1/ew2 -1..-5%); the norm-fed
++# rotate is where the -36% is.
++ROT3_EW = ROT3 and os.environ.get("RADIANCE_PQM_ROT3_EW", "0") == "1"
++# local (2026-09-28 day): RADIANCE_PQM_ROT4=1 -- the same producers on the select-free "rot4" core (par_kernels_mr4.h:
++# the ownership permutation moved from the writes to the reads, so no per-lane output selects). Tables from build_rot4
++# (same shapes as rot3's), launches with v4=1. Byte-identical to stock and rot3 (mr4_check.py ALL EXACT); at M=8192
++# -28..-34% on the norm-fed rotate (K 5120/6144) and the gate / GDN-norm producers, -11% on silu->down.
++ROT4 = ROT3 and os.environ.get("RADIANCE_PQM_ROT4", "0") == "1" and hasattr(_pqk, "build_rot4")
++# debug: RADIANCE_PQM_ROT4_K=5120,17408 limits rot4 to linears with those K (the rest keep rot3 tables + launches)
++_ROT4_K = {int(v) for v in os.environ.get("RADIANCE_PQM_ROT4_K", "").split(",") if v}
++_V4_TABLES: set = set()          # data_ptr of the R tables built as rot4
++_ROT3: dict = {}
++
++
++# the v4 argument only exists in the rot4 .so: pass it only when ROT4 is on, so older kernel builds keep working
++def _rot3_rot(*args):
++    if ROT4:
++        _pqk.launch_rotate_tokquant3_mr(*args, 1 if args[1] in _V4_TABLES else 0)
++    else:
++        _pqk.launch_rotate_tokquant3_mr(*args)
++
++
++def _rot3_ew(*args):
++    if ROT4:
++        _pqk.launch_ew_rot_tok3_mr(*args, 1 if args[6] in _V4_TABLES else 0)
++    else:
++        _pqk.launch_ew_rot_tok3_mr(*args)
++
++
++_REC_DUMP = os.environ.get("RADIANCE_PQM_DUMP_REC", "")   # debug: save every linear's pair records here at load
++
++
++def _rot3_build(rec: torch.Tensor, cs: torch.Tensor | None = None):
++    """rec [P, krot, K/2, 4] int16 (the pair records) -> (R3 same shape, INIT [P, K/128, 32, 4]) on rec's device."""
++    rc = rec.detach().cpu().contiguous()
++    if _REC_DUMP:
++        os.makedirs(_REC_DUMP, exist_ok=True)
++        torch.save({"rec": rc, "cs": None if cs is None else cs.detach().cpu()},
++                   os.path.join(_REC_DUMP, f"rec{len(os.listdir(_REC_DUMP)):03d}.pt"))
++    P, krot, HK, _ = rc.shape
++    r3 = torch.zeros_like(rc)
++    init = torch.zeros((P, (2 * HK) // GROUP, 32, 4), dtype=torch.int16)
++    use4 = ROT4 and (not _ROT4_K or 2 * HK in _ROT4_K)
++    if (_pqk.build_rot4 if use4 else _pqk.build_rot3)(rc.data_ptr(), P, krot, 2 * HK, r3.data_ptr(), init.data_ptr()):
++        return None
++    t = (r3.to(rec.device), init.to(rec.device))
++    if use4:
++        _V4_TABLES.add(t[0].data_ptr())
++    return t
++
++
++_ROT3_BAD: set = set()
++# RADIANCE_PQM_ROT3_DEBUG=N: log the first N rot3 launches (pointers, sizes) to stderr, flushed before the launch --
++# with AMD_SERIALIZE_KERNEL=3 a GPU fault then lands on the last logged line.
++ROT3_DEBUG = int(os.environ.get("RADIANCE_PQM_ROT3_DEBUG", "0"))
++_rot3_dbg_n = [0]
++
++
++def _rot3_log(tag: str, **kv) -> None:
++    if _rot3_dbg_n[0] >= ROT3_DEBUG:
++        return
++    _rot3_dbg_n[0] += 1
++    parts = []
++    for k, v in kv.items():
++        if isinstance(v, torch.Tensor):
++            st = v.untyped_storage()
++            parts.append(f"{k}=ptr {v.data_ptr():#x} shape {tuple(v.shape)} stride {tuple(v.stride())} "
++                         f"stor {st.data_ptr():#x}+{st.nbytes()}")
++        else:
++            parts.append(f"{k}={v}")
++    sys.stderr.write(f"[rot3dbg {_rot3_dbg_n[0]}] {tag} " + " | ".join(parts) + chr(10))
++    sys.stderr.flush()
++
++
++def _rot3_for(rec: torch.Tensor, M: int):
++    if not ROT3 or M <= _mx.DECODE_MAX_M:
++        return None
++    t = _ROT3.get(rec.data_ptr())
++    # The tables are found by the rec tensor's address; guard against a recycled address handing back another
++    # linear's tables (a smaller K would make the kernel read past them): R3 has rec's exact shape.
++    if t is not None and (t[0].shape != rec.shape or t[0].device != rec.device):
++        if rec.data_ptr() not in _ROT3_BAD:
++            _ROT3_BAD.add(rec.data_ptr())
++            sys.stderr.write(f"[radiance.paroquant_mxfp4] rot3 table MISMATCH for rec {tuple(rec.shape)} "
++                             f"(tables {tuple(t[0].shape)}): stock producer used" + chr(10))
++        return None
++    return t
++
++
++# local (2026-09-28): RADIANCE_PQM_SPLIT=1 -- in the decode band (M <= RADIANCE_PQM_SPLIT_MAX_M, default 16) the
++# per-token producers spread each token over ceil(G/16) workgroups (par_kernels_split.h: the last-arriving workgroup
++# encodes the row; codes/scales/HS byte-identical to the stock kernels, split_check.py). The stock kernel runs one
++# workgroup per token, i.e. <= 16 x P CUs busy and 5 serial rotation chains per wave on the 17408-wide down_proj input.
++# Scratch (bf16 rows + per-token amax/counter, left zeroed by every launch) is allocated at weight load, before any
++# CUDA-graph capture.
++SPLIT = os.environ.get("RADIANCE_PQM_SPLIT", "0") == "1" and hasattr(_pqk, "launch_rotate_tokquant_split")
++SPLIT_MAX_M = int(os.environ.get("RADIANCE_PQM_SPLIT_MAX_M", "16"))
++_SPLIT_NMAX, _SPLIT_PMAX = 18432, 3
++_SPLIT: dict = {}
++
++
++def _ensure_split_scratch(device) -> None:
++    if SPLIT and "scr" not in _SPLIT:
++        _SPLIT["scr"] = torch.empty(_SPLIT_PMAX * SPLIT_MAX_M * _SPLIT_NMAX, dtype=torch.bfloat16, device=device)
++        _SPLIT["amax"] = torch.zeros(_SPLIT_PMAX * SPLIT_MAX_M, dtype=torch.int32, device=device)
++        _SPLIT["cnt"] = torch.zeros(_SPLIT_PMAX * SPLIT_MAX_M, dtype=torch.int32, device=device)
++
++
++def _split_ok(M: int, K: int, P: int) -> bool:
++    return SPLIT and M <= SPLIT_MAX_M and K <= _SPLIT_NMAX and P <= _SPLIT_PMAX and "scr" in _SPLIT
+ _checked: set = set()
+ 
+ 
+@@ -110,7 +231,14 @@
+         as_tok = torch.empty((P, M), device=x2.device, dtype=torch.float32)
+         Mt = (M + 15) // 16
+         a_codes = torch.empty((P, Mt * 16 * K), device=x2.device, dtype=torch.uint8)
+-        if FUSED_TOKQ:
++        t3 = _rot3_for(rec, M) if FUSED_TOKQ else None
++        if t3 is not None:
++            if ROT3_DEBUG:
++                _rot3_log(f"rot M={M} K={K} P={P} tiled=1", x=x2, rec=rec, cs=cs, r3=t3[0], init=t3[1], a=a_codes,
++                          as_=as_tok)
++            _rot3_rot(x2.data_ptr(), t3[0].data_ptr(), t3[1].data_ptr(), cs.data_ptr(),
++                                            a_codes.data_ptr(), as_tok.data_ptr(), M, K, P, krot, stream, 1)
++        elif FUSED_TOKQ:
+             # prefill: the fused kernel writes the fragment-tiled layout the A-tiled GEMM reads
+             # directly (par_harness tokqt: byte-exact vs pass A + tiled pass C, 1.3-1.4x faster)
+             _pqk.launch_rotate_tokquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),
+@@ -130,7 +258,15 @@
+         # + e4m3 encode, bit-identical to pass A + pass C (par_harness tokq). Saves a launch and
+         # the HBM round trip of the rotated row per linear; RADIANCE_PQM_FUSED_TOKQ=0 falls back.
+         a_codes = torch.empty((P, M, K), device=x2.device, dtype=torch.uint8)
+-        if FUSED_TOKQ:
++        t3 = _rot3_for(rec, M) if FUSED_TOKQ else None
++        if FUSED_TOKQ and _split_ok(M, K, P):
++            _pqk.launch_rotate_tokquant_split(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), a_codes.data_ptr(),
++                                              as_tok.data_ptr(), _SPLIT["scr"].data_ptr(), _SPLIT["amax"].data_ptr(),
++                                              _SPLIT["cnt"].data_ptr(), M, K, P, krot, stream)
++        elif t3 is not None:
++            _rot3_rot(x2.data_ptr(), t3[0].data_ptr(), t3[1].data_ptr(), cs.data_ptr(),
++                                            a_codes.data_ptr(), as_tok.data_ptr(), M, K, P, krot, stream, 0)
++        elif FUSED_TOKQ:
+             _pqk.launch_rotate_tokquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),
+                                         a_codes.data_ptr(), as_tok.data_ptr(), M, K, P, krot, stream)
+         else:
+@@ -257,10 +393,27 @@
+     tiled = _tiled(M)
+     a = torch.empty((P, ((M + 15) // 16) * 16 * K) if tiled else (P, M, K), device=y.device, dtype=torch.uint8)
+     as_tok = torch.empty((P, M), device=y.device, dtype=torch.float32)
+-    _pqk.launch_add_rms_rot_tok(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
+-                                rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
+-                                a.data_ptr(), as_tok.data_ptr(), M, K, P, rec.shape[1],
+-                                torch.cuda.current_stream().cuda_stream, 1 if tiled else 0)
++    stream = torch.cuda.current_stream().cuda_stream
++    t3 = _rot3_for(rec, M)
++    if t3 is not None:
++        # prefill band (local 2026-09-28): the fused kernel runs the conflict-bound random-pair chain; take the plain
++        # residual-add + norm kernel (pq_add_rms_rot<false>: hs, ro) and the conflict-free producer on hs instead --
++        # the same two passes the stock (stream-1 off) path runs, so stream 1 never costs prefill
++        _pqk.launch_add_rms_rot(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps), rec.data_ptr(),
++                                cs.data_ptr(), hs.data_ptr(), ro.data_ptr(), 0, 0, 0, M, K, P, rec.shape[1], 0, stream, 0)
++        _rot3_rot(hs.data_ptr(), t3[0].data_ptr(), t3[1].data_ptr(), cs.data_ptr(), a.data_ptr(),
++                                        as_tok.data_ptr(), M, K, P, rec.shape[1], stream, 1 if tiled else 0)
++    elif not tiled and M <= 16 and _split_ok(M, K, P) and hasattr(_pqk, "launch_add_rms_rot_tok_split"):
++        # decode band: split-token variant (par_kernels_split.h), byte-identical to the stock W=32 launch (M <= 16)
++        _pqk.launch_add_rms_rot_tok_split(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps), rec.data_ptr(),
++                                          cs.data_ptr(), hs.data_ptr(), ro.data_ptr(), a.data_ptr(), as_tok.data_ptr(),
++                                          _SPLIT["scr"].data_ptr(), _SPLIT["amax"].data_ptr(), _SPLIT["cnt"].data_ptr(),
++                                          M, K, P, rec.shape[1], stream)
++    else:
++        _pqk.launch_add_rms_rot_tok(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
++                                    rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
++                                    a.data_ptr(), as_tok.data_ptr(), M, K, P, rec.shape[1],
++                                    stream, 1 if tiled else 0)
+     return hs.view(y.shape), ro.view(residual.shape), a, as_tok
+ 
+ 
+@@ -297,10 +450,25 @@
+     tiled = _tiled(M)
+     a = torch.empty((1, ((M + 15) // 16) * 16 * N) if tiled else (1, M, N), device=x.device, dtype=torch.uint8)
+     as_tok = torch.empty((1, M), device=x.device, dtype=torch.float32)
+-    _pqk.launch_ew_rot_tok(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
+-                           rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
+-                           as_tok.data_ptr(), M, N, rec.shape[1],
+-                           torch.cuda.current_stream().cuda_stream, 1 if tiled else 0)
++    t3 = _rot3_for(rec, M) if ROT3_EW else None
++    if not tiled and _split_ok(M, N, 1):
++        _pqk.launch_ew_rot_tok_split(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
++                                     rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(), as_tok.data_ptr(),
++                                     _SPLIT["scr"].data_ptr(), _SPLIT["amax"].data_ptr(), _SPLIT["cnt"].data_ptr(),
++                                     M, N, rec.shape[1], torch.cuda.current_stream().cuda_stream)
++    elif t3 is not None:
++        if ROT3_DEBUG:
++            _rot3_log(f"ew{mode} M={M} N={N} ys={ys} tiled={int(tiled)}", x=x2, y=y2, w=w, rec=rec, cs=cs, r3=t3[0],
++                      init=t3[1], hs=hs, a=a, as_=as_tok)
++        _rot3_ew(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
++                                   t3[0].data_ptr(), t3[1].data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
++                                   as_tok.data_ptr(), M, N, rec.shape[1],
++                                   torch.cuda.current_stream().cuda_stream, 1 if tiled else 0, 0 if SKIP_HS else 1)
++    else:
++        _pqk.launch_ew_rot_tok(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
++                               rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
++                               as_tok.data_ptr(), M, N, rec.shape[1],
++                               torch.cuda.current_stream().cuda_stream, 1 if tiled else 0)
+     return hs, a, as_tok
+ 
+ 
+@@ -470,6 +638,17 @@
+         layer.wref = torch.nn.Parameter(wref, requires_grad=False)
+         layer.rec = torch.nn.Parameter(rec.contiguous(), requires_grad=False)
+         layer.cs = torch.nn.Parameter(cs, requires_grad=False)
++        _ensure_split_scratch(layer.rec.device)
++        if ROT3:
++            t3 = _rot3_build(layer.rec.data, layer.cs.data)
++            if t3 is not None:
++                layer.rot3_tables = t3                   # keeps them alive; _ROT3 finds them by rec's address
++                _ROT3[layer.rec.data_ptr()] = t3
++                if ROT3_DEBUG:
++                    _rot3_log(f"register {N}x{K}", rec=layer.rec, r3=t3[0], init=t3[1])
++            else:
++                sys.stderr.write(f"[radiance.paroquant_mxfp4] rot3 tables failed for a {N}x{K} linear; "
++                                 f"stock producers there\n")
+ 
+     # rotation stream (radiance_paroquant.install_stream): the norm / silu-mul / gate / gdn-norm
+     # producers of THIS method build the per-token tuple (hs, A, AS) its GEMM consumes

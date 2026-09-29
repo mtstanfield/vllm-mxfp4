@@ -1,0 +1,22 @@
+--- /mnt/user/appdata/vllm-radiance-next/local-bak/patch_paroquant_install.py.pre-uva	2026-09-28 21:49:36.029995708 -0400
++++ /mnt/user/appdata/vllm-radiance-next/local/patch_paroquant_install.py	2026-09-28 21:50:09.484998164 -0400
+@@ -87,6 +87,19 @@
+         sc = torch.nn.Parameter(torch.ones(n, dtype=torch.float32), requires_grad=False)
+         set_weight_attrs(sc, {"output_dim": 0}); set_weight_attrs(sc, extra_weight_attrs)
+         layer.register_parameter("weight_scale", sc)
++    def process_weights_after_loading(self, layer):
++        # local patch (2026-09-29, PQ_EMBED_UVA=1): keep the 1.2 GiB fp8 table in pinned host memory; the lookup below gathers
++        # its rows over PCIe through a UVA view (~50 KB per decode step, ~42 MB per 8k prefill chunk) and the VRAM goes to the
++        # KV pool. Deliberately not a RADIANCE_* name: where the table lives never changes a traced graph, so it must not
++        # re-key the AOT compile cache (patch_aot_envkey.py hashes RADIANCE_*).
++        import os
++        if os.environ.get("PQ_EMBED_UVA", "0") != "1" or layer.weight.device.type == "cpu":
++            return
++        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++        host = layer.weight.data.to("cpu").pin_memory()
++        layer.weight.data = get_accelerator_view_from_cpu_tensor(host)
++        layer._pq_uva_host = host   # keep the pinned buffer alive whether or not the view owns it
++        print(f"[paroquant] fp8 embed_tokens -> pinned host memory via UVA ({host.numel() / 2**30:.2f} GiB off the GPU)", flush=True)
+     def embedding(self, layer, input_):
+         rows = layer.weight.view(torch.uint8)[input_].view(torch.float8_e4m3fn)
+         return rows.to(torch.bfloat16) * layer.weight_scale[input_].unsqueeze(-1).to(torch.bfloat16)

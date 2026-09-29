@@ -114,6 +114,21 @@ ROT_STREAM = os.environ.get("RADIANCE_PQ_ROT_STREAM", "0") == "1"
 # Stream 2: the three single-partition producers (silu-mul -> down_proj, GDN gated norm ->
 # out_proj, attention gate -> o_proj) fused with rotate + quant the same way. Needs ROT_STREAM.
 ROT_STREAM2 = ROT_STREAM and os.environ.get("RADIANCE_PQ_ROT_STREAM2", "0") == "1"
+# local (2026-09-28): stream 1 (the input/mid add+norm+rotate+quant epilogues below) has NEVER been live on the
+# paroquant serve: radiance_arnq.install (RADIANCE_FP8_STREAM, serve-mxfp4.sh default 1) runs after install_stream at
+# the end of radiance_gdnmerge.merge_model and overwrites every decoder layer's forward (it installs 0 epilogues here).
+# RADIANCE_FP8_STREAM=0 makes it live -- measured 2026-09-28: not byte-exact (norm reduction order), ~5% slower per
+# decode step, not adopted. RADIANCE_PQ_STREAM_CLASSFWD=1 (class-level dispatch) was a wrong theory; kept inert.
+STREAM_CLASSFWD = ROT_STREAM and os.environ.get("RADIANCE_PQ_STREAM_CLASSFWD", "0") == "1"
+# local (2026-09-28): RADIANCE_LOCAL_GDN_NOCOPY=1 (with local/patch_gdn_nocopy.py, same env). The z-in-place half
+# (RADIANCE_LOCAL_GDN_NOCOPY_Z, default 1 when NOCOPY) is NOT exact at 100k and those boots hit a GPU memory fault in
+# the rot3 ew producer -- do not enable in production (docs/vllm-radiance-review-20260927.md, Round 4).
+GDN_NOCOPY = os.environ.get("RADIANCE_LOCAL_GDN_NOCOPY", "0") == "1"
+GDN_NOCOPY_Z = GDN_NOCOPY and os.environ.get("RADIANCE_LOCAL_GDN_NOCOPY_Z", "1") == "1"   # 0: keep the z copy (A/B)
+# debug (eager boots only: it branches on tensor data): RADIANCE_DEBUG_ZCHECK=1 snapshots the in-place z view before the
+# GDN core op and reports if the op changed the projection's z region
+ZCHECK = os.environ.get("RADIANCE_DEBUG_ZCHECK", "0") == "1"
+_zcheck_n = [0]
 _checked = set()
 
 
@@ -676,12 +691,29 @@ def _rot_gdn_forward_hip(self, hidden_states):
     core_attn_out = torch.empty(
         (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
         dtype=hsb.dtype, device=hsb.device)
-    z = torch.empty(
-        (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-        dtype=projected_states_qkvz.dtype, device=projected_states_qkvz.device)
+    if GDN_NOCOPY_Z and getattr(self, "_pq_gdn_norm_stream", False) and not self.gqa_interleaved_layout:
+        # local/patch_gdn_nocopy.py: the gate is read in place from the projection (Qwen3.5 [q, k, v, z] rows; the
+        # stream gated-norm producer takes the row stride) and the core op skips its copy for an empty z_out
+        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        z = projected_states_qkvz[:, qkv_size:].unflatten(-1, (self.num_v_heads // self.tp_size, self.head_v_dim))
+        z_arg = projected_states_qkvz.new_empty(0)
+    else:
+        z = torch.empty(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=projected_states_qkvz.dtype, device=projected_states_qkvz.device)
+        z_arg = z
+    zsnap = z.clone() if ZCHECK and z_arg.numel() == 0 else None
     torch.ops.vllm.qwen_gdn_attention_core(
-        projected_states_qkvz, projected_states_ba, z, core_attn_out,
+        projected_states_qkvz, projected_states_ba, z_arg, core_attn_out,
         layer_name=_g._encode_layer_name(self.prefix), use_aiter=True)
+    if zsnap is not None and _zcheck_n[0] < 40:
+        bad = (zsnap != z).reshape(num_tokens, -1)
+        nbad = int(bad.sum())
+        _zcheck_n[0] += 1
+        rows = bad.any(-1).nonzero().flatten().tolist()[:8]
+        sys.stderr.write(f"[zcheck] {self.prefix} T={num_tokens}: {nbad} z elements changed by the core op, rows {rows}"
+                         + chr(10))
+        sys.stderr.flush()
     return self._output_projection(core_attn_out, z)
 
 
@@ -695,6 +727,22 @@ def _is_pq(lin) -> bool:
 def _is_pq_ar(lin) -> bool:
     """Stream 3 (fused all-reduce) only exists for the int4 per-group tuple."""
     return _is_pq(lin) and getattr(lin.quant_method, "pq_ar_capable", False)
+
+
+def _install_stream_class_forward(cls) -> None:
+    """Class-level dispatch to _rot_layer_forward for layers install_stream() marked (see STREAM_CLASSFWD)."""
+    if getattr(cls, "_pq_stream_classfwd", False):
+        return
+    stock = cls.forward
+
+    def forward(self, *args, **kwargs):
+        if getattr(self, "_pq_stream_layer", False):
+            return _rot_layer_forward(self, *args, **kwargs)
+        return stock(self, *args, **kwargs)
+
+    cls.forward = forward
+    cls._pq_stream_classfwd = True
+    sys.stderr.write(f"[radiance.paroquant] rot stream: class-level forward dispatch on {cls.__name__}" + chr(10))
 
 
 def install_stream(model) -> None:
@@ -759,6 +807,9 @@ def install_stream(model) -> None:
             layer._pq_rot_mid = cons_mid
             n_mid += 1
         layer.forward = types.MethodType(_rot_layer_forward, layer)
+        if STREAM_CLASSFWD:
+            layer._pq_stream_layer = True
+            _install_stream_class_forward(type(layer))
         if ar_ok:
             # mid: this layer's o_proj/out_proj stays partial, the mid epilogue reduces it
             row = (layer.linear_attn.out_proj if layer.layer_type == "linear_attention"
@@ -797,6 +848,7 @@ def install_stream(model) -> None:
                 if why is None:
                     layer.linear_attn._output_projection = types.MethodType(
                         _rot_gdn_output_projection, layer.linear_attn)
+                    layer.linear_attn._pq_gdn_norm_stream = True
                     n_gnq += 1
                 else:
                     sys.stderr.write(f"[radiance.paroquant] rot stream2: layer {i} gdn norm stock ({why})\n")

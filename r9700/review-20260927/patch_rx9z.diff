@@ -1,0 +1,109 @@
+--- b9e42ab-rx9y/r4d_attn_paged_h256_gqa6.hip	2026-09-27 13:17:50.760266661 -0400
++++ b9e42ab-rx9z/r4d_attn_paged_h256_gqa6.hip	2026-09-28 10:15:03.487063025 -0400
+@@ -46,9 +46,24 @@
+ // ---- prefill ---------------------------------------------------------------------------------
+ // LDS, head_dim 256, 16-bit K and V: sK = TILE*264*2, sV = 256*(TILE+8)*2. bf16 KV at TILE 64
+ // would need 68096 B > 65536, so the geometry stops at 48.
++#ifndef P_NWARPS
+ #define P_NWARPS 24
++#endif
++#ifndef P_TILE
+ #define P_TILE   48
++#endif
++// local (2026-09-28): the tile for the modes with BOTH 8-bit legs (15/7/3). K and V are bytes in LDS there, so the
++// 48-key cap above (set by the 16-bit legs) does not bind: TILE 64 needs ~35 KB, 96 ~52 KB.
++#ifndef P_TILE8
++#define P_TILE8  48
++#endif
+ #define P_OPT    3955211
++// local (2026-09-28, rx9z): option bits XORed into mode 15 only -- the scheduling/staging bits were tuned for the 16-bit
++// legs. Re-swept under mode 15 (attn_bench.py, 8k chunk at 8k/64k/128k): PF8 (1024 flips PF4 -> PF8) is +2.3% and
++// bit-identical; SGB / GPREV / LDSB / BTS / MSKIP off and PF2 are neutral or worse; TILE 64/80/96 neutral.
++#ifndef P_OPT15_XOR
++#define P_OPT15_XOR 1024
++#endif
+ 
+ // KVP: 0 = fp8 e4m3 cache, 1 = bf16 cache. Reached only through the two named wrappers below.
+ template <int KVP>
+@@ -72,18 +87,19 @@
+         }();
+         fp8mode = m;
+     }
+-#define P_LAUNCH(OPTX)                                                                            \
++#define P_LAUNCH_T(TL, OPTX)                                                                      \
+     do {                                                                                          \
+-        hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA,          \
++        hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, TL, A_HEAD_DIM, A_GQA,              \
+                                                     A_BLOCK_SIZE, KVP, OPTX>),                    \
+                            grid, dim3(P_NWARPS * 32), 0, s, *a);                                  \
+     } while (0)
++#define P_LAUNCH(OPTX) P_LAUNCH_T(P_TILE, OPTX)
+     if constexpr (!KVP) {
+-        if (fp8mode == 15)     P_LAUNCH(P_OPT | O_QK8 | O_PV8 | O_PVDEN | O_PVSH);   // rx9y: 7 + PVSH
++        if (fp8mode == 15)     P_LAUNCH_T(P_TILE8, (P_OPT | O_QK8 | O_PV8 | O_PVDEN | O_PVSH) ^ P_OPT15_XOR);   // rx9y: 7 + PVSH
+         else if (fp8mode == 14) P_LAUNCH(P_OPT | O_PV8 | O_PVDEN | O_PVSH);         // rx9y: 6 + PVSH
+-        else if (fp8mode == 7) P_LAUNCH(P_OPT | O_QK8 | O_PV8 | O_PVDEN);   // rx9y: 3 + PVDEN
++        else if (fp8mode == 7) P_LAUNCH_T(P_TILE8, P_OPT | O_QK8 | O_PV8 | O_PVDEN);   // rx9y: 3 + PVDEN
+         else if (fp8mode == 6) P_LAUNCH(P_OPT | O_PV8 | O_PVDEN);           // rx9y: 2 + PVDEN
+-        else if (fp8mode == 3) P_LAUNCH(P_OPT | O_QK8 | O_PV8);
++        else if (fp8mode == 3) P_LAUNCH_T(P_TILE8, P_OPT | O_QK8 | O_PV8);
+         else if (fp8mode == 2) P_LAUNCH(P_OPT | O_PV8);
+         else if (fp8mode == 1) P_LAUNCH(P_OPT | O_QK8);
+         else                   P_LAUNCH(P_OPT);
+@@ -91,6 +107,7 @@
+         P_LAUNCH(P_OPT);
+     }
+ #undef P_LAUNCH
++#undef P_LAUNCH_T
+     CHK();
+     return 0;
+ }
+--- b9e42ab-rx9y/r4d_attn_prefill_h256_gqa6.hip	2026-09-27 13:17:50.760146321 -0400
++++ b9e42ab-rx9z/r4d_attn_prefill_h256_gqa6.hip	2026-09-28 10:15:03.484063025 -0400
+@@ -36,6 +36,12 @@
+ #include "r4d_common.h"
+ #include "r4d_dt16.h"
+ 
++#ifndef R4D_PVDEN_LATE
++#define R4D_PVDEN_LATE 1   // rx9z
++#endif
++#ifndef R4D_PVDEN_DOT4
++#define R4D_PVDEN_DOT4 1   // rx9z
++#endif
+ #define O_F16     1
+ #define O_MSKIP   2
+ // QK8/PV8: the deleted 8-bit arms, rebuilt as SEPARABLE opt-in bits for long-context serving.
+@@ -459,7 +465,9 @@
+             if constexpr (PV8) {
+                 const v2i32_r4d p8 = (v2i32_r4d){(int)pk_fp8x4(pf[0], pf[1], pf[2], pf[3]),
+                                                  (int)pk_fp8x4(pf[4], pf[5], pf[6], pf[7])};
+-                if constexpr (PVDEN) {       // rx9y: the denominator of exactly the P the PV WMMA uses
++                // PVDEN (rx9y) is summed AFTER the PV WMMAs below (local 2026-09-28, R4D_PVDEN_LATE): nothing in the PV
++                // matmul depends on it, and ahead of it its cvt/add dependency chain stalled the wave's in-order issue.
++                if constexpr (PVDEN && !R4D_PVDEN_LATE) {       // rx9y: the denominator of exactly the P the PV WMMA uses
+                     const v2f a0 = __builtin_amdgcn_cvt_pk_f32_fp8(p8.x, false);
+                     const v2f a1 = __builtin_amdgcn_cvt_pk_f32_fp8(p8.x, true);
+                     const v2f a2 = __builtin_amdgcn_cvt_pk_f32_fp8(p8.y, false);
+@@ -478,6 +486,22 @@
+                     for (int j = 0; j < PF; ++j)
+                         acc[g + j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(vb8[j], p8, acc[g + j]);
+                 }
++                if constexpr (PVDEN && R4D_PVDEN_LATE) {
++                    if constexpr (R4D_PVDEN_DOT4) {
++                        // local 2026-09-28: the same sum as two fp8 dot4s against 1.0 (e4m3 0x38). Bit-identical: every
++                        // partial sum of <= 8 e4m3 values is exact in fp32 (a 4-bit significand spread over at most 2^17
++                        // of range), so only the final l_i += rounds, as before -- 2 VALU instead of 11.
++                        const float t = __builtin_amdgcn_dot4_f32_fp8_fp8(p8.y, 0x38383838,
++                                            __builtin_amdgcn_dot4_f32_fp8_fp8(p8.x, 0x38383838, 0.0f));
++                        l_i += t;
++                    } else {
++                    const v2f a0 = __builtin_amdgcn_cvt_pk_f32_fp8(p8.x, false);
++                    const v2f a1 = __builtin_amdgcn_cvt_pk_f32_fp8(p8.x, true);
++                    const v2f a2 = __builtin_amdgcn_cvt_pk_f32_fp8(p8.y, false);
++                    const v2f a3 = __builtin_amdgcn_cvt_pk_f32_fp8(p8.y, true);
++                    l_i += ((a0.x + a0.y) + (a1.x + a1.y)) + ((a2.x + a2.y) + (a3.x + a3.y));
++                    }
++                }
+             } else {
+                 uint32_t pw[4];
+                 #pragma unroll

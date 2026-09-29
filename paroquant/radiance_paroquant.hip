@@ -5,6 +5,9 @@
 // the AutoRound module: a kernel gated in a harness and then re-typed into the serving module is a
 // kernel that has not been gated.
 #include "par_kernels.h"
+#include "par_kernels_mr.h"   // local 2026-09-28: multi-row per-token producers (prefill band)
+#include "par_kernels_mr3.h"  // local 2026-09-28: + the conflict-free ownership-layout rotation core
+#include "par_kernels_split.h" // local 2026-09-28: split-token decode producers (last-arriving WG encodes)
 
 #include <pybind11/pybind11.h>
 #include <stdexcept>
@@ -151,6 +154,13 @@ static int build_rot3(uintptr_t t, int P, int krot, int K, uintptr_t r3, uintptr
                        reinterpret_cast<unsigned short *>(r3), reinterpret_cast<unsigned short *>(init));
 }
 
+// local 2026-09-28 day: select-free rot4 tables (par_kernels_mr4.h), same shapes as build_rot3's; use with v4=1.
+static int build_rot4(uintptr_t t, int P, int krot, int K, uintptr_t r4, uintptr_t fin) {
+  if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
+  return pq_build_rot4(reinterpret_cast<const unsigned short *>(t), P, krot, K,
+                       reinterpret_cast<unsigned short *>(r4), reinterpret_cast<unsigned short *>(fin));
+}
+
 static void launch_rotate_groupquant(uintptr_t x, uintptr_t t, uintptr_t cs, uintptr_t a, uintptr_t asg,
                                      uintptr_t rs, int M, int K, int P, int krot, uintptr_t stream,
                                      int tiled = 0, int i8 = 0, uintptr_t r3 = 0, uintptr_t init = 0) {
@@ -248,6 +258,139 @@ static void launch_ew_rot_tok(int mode, uintptr_t x, uintptr_t y, long ys, uintp
   else       { if (W == 32) { PQ_EWT_W(32, false); } else if (W == 16) { PQ_EWT_W(16, false); } else { PQ_EWT_W(8, false); } }
 #undef PQ_EWT_W
 #undef PQ_EWT
+}
+
+// ---- local 2026-09-28: multi-row producers (par_kernels_mr.h). Byte-identical codes/scales to the stock launchers
+// above; R rows per workgroup share each group's rotation records. RADIANCE_PQ_MR_ROWS=4|8 picks R on the K<=6144
+// layout (8 waves x 6 groups); K up to 18432 takes 16 waves x 9 groups x 4 rows.
+static int pq_mr_rows() {
+  static int r = -1;
+  if (r < 0) {
+    const char *e = getenv("RADIANCE_PQ_MR_ROWS");
+    r = (e && *e) ? atoi(e) : 0;                    // 0 = per-kernel default (measured, mr_check.py)
+    if (r != 1 && r != 2 && r != 4 && r != 8) r = 0;
+  }
+  return r;
+}
+
+static void launch_rotate_tokquant_mr(uintptr_t x, uintptr_t t, uintptr_t cs, uintptr_t a, uintptr_t as,
+                                      int M, int K, int P, int krot, uintptr_t stream, int tiled = 0) {
+  if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  const int G = K / PQ_GROUP;
+  auto st = reinterpret_cast<hipStream_t>(stream);
+#define PQ_RMR(W_, R_, GPW_, T_)                                                                 \
+  hipLaunchKernelGGL((pq_rotate_tokquant_mr<W_, R_, GPW_, T_>), dim3((M + R_ - 1) / R_, P), dim3(W_ * 32), 0, st, \
+                     reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const unsigned short *>(t), \
+                     reinterpret_cast<const __half *>(cs), reinterpret_cast<unsigned char *>(a),  \
+                     reinterpret_cast<float *>(as), M, K, krot)
+  if (G <= 8 * 6) {
+    if (pq_mr_rows() == 4) { if (tiled) PQ_RMR(8, 4, 6, true); else PQ_RMR(8, 4, 6, false); }
+    else                   { if (tiled) PQ_RMR(8, 8, 6, true); else PQ_RMR(8, 8, 6, false); }
+  } else if (G <= 16 * 9) {
+    if (tiled) PQ_RMR(16, 4, 9, true); else PQ_RMR(16, 4, 9, false);
+  } else {
+    throw std::runtime_error("ParoQuant: rotate_tokquant_mr supports K <= 18432");
+  }
+#undef PQ_RMR
+}
+
+static void launch_ew_rot_tok_mr(int mode, uintptr_t x, uintptr_t y, long ys, uintptr_t w, double eps,
+                                 uintptr_t t, uintptr_t cs, uintptr_t hs, uintptr_t a, uintptr_t as,
+                                 int M, int N, int krot, uintptr_t stream, int tiled = 0, int whs = 1) {
+  if (N % PQ_GROUP) throw std::runtime_error("ParoQuant: N must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  const int G = N / PQ_GROUP;
+  auto st = reinterpret_cast<hipStream_t>(stream);
+#define PQ_EMR(MODE_, W_, R_, GPW_, T_, H_)                                                      \
+  hipLaunchKernelGGL((pq_ew_rot_tok_mr<MODE_, W_, R_, GPW_, T_, H_>), dim3((M + R_ - 1) / R_), dim3(W_ * 32), 0, st, \
+                     reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const __bf16 *>(y),    \
+                     ys, reinterpret_cast<const __bf16 *>(w), (float)eps,                         \
+                     reinterpret_cast<const unsigned short *>(t),                                \
+                     reinterpret_cast<const __half *>(cs), reinterpret_cast<__bf16 *>(hs),        \
+                     reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(as), M, N, krot)
+#define PQ_EMR_TH(MODE_, W_, R_, GPW_)                                                            \
+  if (tiled) { if (whs) PQ_EMR(MODE_, W_, R_, GPW_, true, true); else PQ_EMR(MODE_, W_, R_, GPW_, true, false); } \
+  else       { if (whs) PQ_EMR(MODE_, W_, R_, GPW_, false, true); else PQ_EMR(MODE_, W_, R_, GPW_, false, false); }
+  if (mode == 0) {                                   // silu-mul into down_proj: N = intermediate (17408)
+    if (G > 16 * 9) throw std::runtime_error("ParoQuant: ew_rot_tok_mr mode 0 supports N <= 18432");
+    PQ_EMR_TH(0, 16, 4, 9)
+  } else {                                           // attention gate / GDN gated norm: N = 6144
+    if (G > 8 * 6) throw std::runtime_error("ParoQuant: ew_rot_tok_mr modes 1/2 support N <= 6144");
+    if (mode == 1) { if (pq_mr_rows() == 4) { PQ_EMR_TH(1, 8, 4, 6) } else { PQ_EMR_TH(1, 8, 8, 6) } }
+    else           { if (pq_mr_rows() == 4) { PQ_EMR_TH(2, 8, 4, 6) } else { PQ_EMR_TH(2, 8, 8, 6) } }
+  }
+#undef PQ_EMR_TH
+#undef PQ_EMR
+}
+
+// ---- local 2026-09-28: conflict-free + multi-row producers (par_kernels_mr3.h). r3/init = build_rot3's tables for
+// the SAME pair records the stock launchers take; codes/scales byte-identical to them.
+static void launch_rotate_tokquant3_mr(uintptr_t x, uintptr_t r3, uintptr_t init, uintptr_t cs, uintptr_t a,
+                                       uintptr_t as, int M, int K, int P, int krot, uintptr_t stream, int tiled = 0,
+                                       int v4 = 0) {
+  if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  if (!r3 || !init) throw std::runtime_error("ParoQuant: rotate_tokquant3_mr needs the rot3 tables");
+  const int G = K / PQ_GROUP;
+  auto st = reinterpret_cast<hipStream_t>(stream);
+#define PQ_RMR3V(W_, R_, GPW_, T_, V_)                                                               \
+  hipLaunchKernelGGL((pq_rotate_tokquant3_mr<W_, R_, GPW_, T_, V_>), dim3((M + R_ - 1) / R_, P), dim3(W_ * 32), 0, st, \
+                     reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const unsigned short *>(r3), \
+                     reinterpret_cast<const unsigned short *>(init),                             \
+                     reinterpret_cast<const __half *>(cs), reinterpret_cast<unsigned char *>(a),  \
+                     reinterpret_cast<float *>(as), M, K, krot)
+#define PQ_RMR3(W_, R_, GPW_, T_) do { if (v4) PQ_RMR3V(W_, R_, GPW_, T_, true); else PQ_RMR3V(W_, R_, GPW_, T_, false); } while (0)
+  const int rr = pq_mr_rows();
+  if (G <= 8 * 6) {                                  // default R=2: -36% vs stock at M=8192 (K=5120/6144)
+    if (rr == 1)      { if (tiled) PQ_RMR3(8, 1, 6, true); else PQ_RMR3(8, 1, 6, false); }
+    else if (rr == 4) { if (tiled) PQ_RMR3(8, 4, 6, true); else PQ_RMR3(8, 4, 6, false); }
+    else if (rr == 8) { if (tiled) PQ_RMR3(8, 8, 6, true); else PQ_RMR3(8, 8, 6, false); }
+    else              { if (tiled) PQ_RMR3(8, 2, 6, true); else PQ_RMR3(8, 2, 6, false); }
+  } else if (G <= 16 * 9) {                          // default R=4: -42% at K=17408
+    if (rr == 2) { if (tiled) PQ_RMR3(16, 2, 9, true); else PQ_RMR3(16, 2, 9, false); }
+    else         { if (tiled) PQ_RMR3(16, 4, 9, true); else PQ_RMR3(16, 4, 9, false); }
+  } else {
+    throw std::runtime_error("ParoQuant: rotate_tokquant3_mr supports K <= 18432");
+  }
+#undef PQ_RMR3
+#undef PQ_RMR3V
+}
+
+static void launch_ew_rot_tok3_mr(int mode, uintptr_t x, uintptr_t y, long ys, uintptr_t w, double eps,
+                                  uintptr_t r3, uintptr_t init, uintptr_t cs, uintptr_t hs, uintptr_t a,
+                                  uintptr_t as, int M, int N, int krot, uintptr_t stream, int tiled = 0,
+                                  int whs = 1, int v4 = 0) {
+  if (N % PQ_GROUP) throw std::runtime_error("ParoQuant: N must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  if (!r3 || !init) throw std::runtime_error("ParoQuant: ew_rot_tok3_mr needs the rot3 tables");
+  const int G = N / PQ_GROUP;
+  auto st = reinterpret_cast<hipStream_t>(stream);
+#define PQ_EMR3V(MODE_, W_, R_, GPW_, T_, H_, V_)                                                    \
+  hipLaunchKernelGGL((pq_ew_rot_tok3_mr<MODE_, W_, R_, GPW_, T_, H_, V_>), dim3((M + R_ - 1) / R_), dim3(W_ * 32), 0, st, \
+                     reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const __bf16 *>(y),    \
+                     ys, reinterpret_cast<const __bf16 *>(w), (float)eps,                         \
+                     reinterpret_cast<const unsigned short *>(r3),                               \
+                     reinterpret_cast<const unsigned short *>(init),                             \
+                     reinterpret_cast<const __half *>(cs), reinterpret_cast<__bf16 *>(hs),        \
+                     reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(as), M, N, krot)
+#define PQ_EMR3(MODE_, W_, R_, GPW_, T_, H_) do { if (v4) PQ_EMR3V(MODE_, W_, R_, GPW_, T_, H_, true); else PQ_EMR3V(MODE_, W_, R_, GPW_, T_, H_, false); } while (0)
+#define PQ_EMR3_TH(MODE_, W_, R_, GPW_)                                                           \
+  if (tiled) { if (whs) PQ_EMR3(MODE_, W_, R_, GPW_, true, true); else PQ_EMR3(MODE_, W_, R_, GPW_, true, false); } \
+  else       { if (whs) PQ_EMR3(MODE_, W_, R_, GPW_, false, true); else PQ_EMR3(MODE_, W_, R_, GPW_, false, false); }
+  if (mode == 0) {
+    if (G > 16 * 9) throw std::runtime_error("ParoQuant: ew_rot_tok3_mr mode 0 supports N <= 18432");
+    const int r0 = pq_mr_rows();                     // default R=1 (the ew producers are not conflict-bound)
+    if (r0 == 2) { PQ_EMR3_TH(0, 16, 2, 9) } else if (r0 == 4) { PQ_EMR3_TH(0, 16, 4, 9) } else { PQ_EMR3_TH(0, 16, 1, 9) }
+  } else {
+    if (G > 8 * 6) throw std::runtime_error("ParoQuant: ew_rot_tok3_mr modes 1/2 support N <= 6144");
+    const int rr = pq_mr_rows();
+    if (mode == 1) { if (rr == 2) { PQ_EMR3_TH(1, 8, 2, 6) } else if (rr == 4) { PQ_EMR3_TH(1, 8, 4, 6) } else if (rr == 8) { PQ_EMR3_TH(1, 8, 8, 6) } else { PQ_EMR3_TH(1, 8, 1, 6) } }
+    else           { if (rr == 2) { PQ_EMR3_TH(2, 8, 2, 6) } else if (rr == 4) { PQ_EMR3_TH(2, 8, 4, 6) } else if (rr == 8) { PQ_EMR3_TH(2, 8, 8, 6) } else { PQ_EMR3_TH(2, 8, 1, 6) } }
+  }
+#undef PQ_EMR3_TH
+#undef PQ_EMR3
+#undef PQ_EMR3V
 }
 
 // Skinny bf16 GEMM (see pq_skinny_bf16). p = fp32 partial scratch [K/256][M][N], cnt = int[N/16]
@@ -518,11 +661,73 @@ static void launch_gemm(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t asg, u
 }
 
 namespace py = pybind11;
+// ---- local 2026-09-28: split-token decode producers (par_kernels_split.h). Byte-identical to launch_rotate_tokquant
+// / launch_ew_rot_tok row-major. scr = bf16 scratch >= P*M*K, gamax/gcnt = zeroed u32/i32 >= P*M (left zeroed).
+// RADIANCE_PQ_SPLIT_W = 8|16|32 waves (= groups) per workgroup, default 16.
+static int pq_split_w() {
+  static int w = -1;
+  if (w < 0) {
+    const char *e = getenv("RADIANCE_PQ_SPLIT_W");
+    w = (e && *e) ? atoi(e) : PQ_SPLIT_W;
+    if (w != 8 && w != 16 && w != 32) w = PQ_SPLIT_W;
+  }
+  return w;
+}
+
+static void launch_rotate_tokquant_split(uintptr_t x, uintptr_t t, uintptr_t cs, uintptr_t a, uintptr_t as,
+                                         uintptr_t scr, uintptr_t gamax, uintptr_t gcnt, int M, int K, int P,
+                                         int krot, uintptr_t stream) {
+  if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  const int G = K / PQ_GROUP, W = pq_split_w();
+  auto st = reinterpret_cast<hipStream_t>(stream);
+#define PQ_TQS(W_)                                                                                  hipLaunchKernelGGL((pq_rotate_tokquant_split<W_>), dim3((G + W_ - 1) / W_, M, P), dim3(W_ * 32), 0, st,                      reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const unsigned short *>(t),                      reinterpret_cast<const __half *>(cs), reinterpret_cast<unsigned char *>(a),                       reinterpret_cast<float *>(as), reinterpret_cast<__bf16 *>(scr),                                   reinterpret_cast<unsigned int *>(gamax), reinterpret_cast<int *>(gcnt), M, K, krot)
+  if (W == 8) PQ_TQS(8); else if (W == 32) PQ_TQS(32); else PQ_TQS(16);
+#undef PQ_TQS
+}
+
+static void launch_ew_rot_tok_split(int mode, uintptr_t x, uintptr_t y, long ys, uintptr_t w, double eps,
+                                    uintptr_t t, uintptr_t cs, uintptr_t hs, uintptr_t a, uintptr_t as,
+                                    uintptr_t scr, uintptr_t gamax, uintptr_t gcnt, int M, int N, int krot,
+                                    uintptr_t stream) {
+  if (N % PQ_GROUP) throw std::runtime_error("ParoQuant: N must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  const int G = N / PQ_GROUP, W = pq_split_w();
+  auto st = reinterpret_cast<hipStream_t>(stream);
+#define PQ_EWS(MODE_, W_)                                                                           hipLaunchKernelGGL((pq_ew_rot_tok_split<MODE_, W_>), dim3((G + W_ - 1) / W_, M), dim3(W_ * 32), 0, st,                      reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const __bf16 *>(y),                         ys, reinterpret_cast<const __bf16 *>(w), (float)eps,                                              reinterpret_cast<const unsigned short *>(t),                                                     reinterpret_cast<const __half *>(cs), reinterpret_cast<__bf16 *>(hs),                             reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(as),                              reinterpret_cast<__bf16 *>(scr), reinterpret_cast<unsigned int *>(gamax),                         reinterpret_cast<int *>(gcnt), M, N, krot)
+#define PQ_EWS_W(MODE_) if (W == 8) PQ_EWS(MODE_, 8); else if (W == 32) PQ_EWS(MODE_, 32); else PQ_EWS(MODE_, 16)
+  if (mode == 0) { PQ_EWS_W(0); } else if (mode == 1) { PQ_EWS_W(1); } else { PQ_EWS_W(2); }
+#undef PQ_EWS_W
+#undef PQ_EWS
+}
+
+// Stream 1 split (pq_add_rms_rot_tok_split): only where the stock launch takes W == 32 (M <= 16), which the byte-exact
+// row pass requires. 16 groups per workgroup.
+static void launch_add_rms_rot_tok_split(uintptr_t y, uintptr_t res, uintptr_t w, double eps, uintptr_t t, uintptr_t cs,
+                                         uintptr_t hs, uintptr_t ro, uintptr_t a, uintptr_t as, uintptr_t scr,
+                                         uintptr_t gamax, uintptr_t gcnt, int M, int K, int P, int krot,
+                                         uintptr_t stream) {
+  if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  if (pq_tok_waves(M, K) != 32) throw std::runtime_error("ParoQuant: add_rms_rot_tok_split needs the W=32 band (M <= 16)");
+  const int G = K / PQ_GROUP;
+  hipLaunchKernelGGL((pq_add_rms_rot_tok_split<32, 16>), dim3((G + 15) / 16, M, P), dim3(32 * 32), 0,
+                     reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const __bf16 *>(y), reinterpret_cast<const __bf16 *>(res),
+                     reinterpret_cast<const __bf16 *>(w), (float)eps,
+                     reinterpret_cast<const unsigned short *>(t), reinterpret_cast<const __half *>(cs),
+                     reinterpret_cast<__bf16 *>(hs), reinterpret_cast<__bf16 *>(ro),
+                     reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(as),
+                     reinterpret_cast<__bf16 *>(scr), reinterpret_cast<unsigned int *>(gamax),
+                     reinterpret_cast<int *>(gcnt), M, K, krot);
+}
+
 PYBIND11_MODULE(radiance_paroquant_kernel, m) {
   m.def("launch_rotate_tokquant", &launch_rotate_tokquant,
         "x, T, cs, a, as, M, K, P, krot, stream, tiled (tiled=1 writes the fragment-tiled A the A-tiled GEMM reads)", py::arg("x"), py::arg("T"), py::arg("cs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0, py::arg("rs") = 0, py::arg("i8") = 0);
   m.def("launch_rs_to_rsh", &launch_rs_to_rsh, "RS [P,M,G] f32 -> RSH fp16 WMMA fragments (ZPE operand): rs, rsh, M, G, P, stream");
   m.def("build_rot3", &build_rot3, "conflict-free producer tables (CPU): t, P, krot, K, r3_out, init_out -> failures");
+  m.def("build_rot4", &build_rot4, "select-free (read-routed) producer tables (CPU): t, P, krot, K, r4_out, fin_out -> failures");
   m.def("launch_rotate_groupquant", &launch_rotate_groupquant,
         "x, T, cs, a, asg, rs, M, K, P, krot, stream, tiled, i8, r3, init (per-group fused producer for the PG A-tiled band; tiled=3 = conflict-free quant3 with r3/init)",
         py::arg("x"), py::arg("T"), py::arg("cs"), py::arg("a"), py::arg("asg"), py::arg("rs"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0, py::arg("i8") = 0, py::arg("r3") = 0, py::arg("init") = 0);
@@ -531,6 +736,24 @@ PYBIND11_MODULE(radiance_paroquant_kernel, m) {
   m.def("launch_ew_rot_tok", &launch_ew_rot_tok,
         "mode, x, y, ys, w, eps, T, cs, hs, a, as, M, N, krot, stream, tiled (tiled=1 writes the fragment-tiled A the A-tiled GEMM reads)", py::arg("mode"), py::arg("x"), py::arg("y"), py::arg("ys"), py::arg("w"), py::arg("eps"), py::arg("T"), py::arg("cs"), py::arg("hs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("N"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0);
   m.def("launch_skinny_bf16", &launch_skinny_bf16, "skinny bf16 GEMM C=X.W^T: x, w, c, partials, cnt, M, N, K, stream");
+  m.def("launch_rotate_tokquant_mr", &launch_rotate_tokquant_mr,
+        "multi-row launch_rotate_tokquant (prefill band, byte-identical): x, T, cs, a, as, M, K, P, krot, stream, tiled",
+        py::arg("x"), py::arg("T"), py::arg("cs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0);
+  m.def("launch_rotate_tokquant3_mr", &launch_rotate_tokquant3_mr,
+        "conflict-free multi-row launch_rotate_tokquant (byte-identical): x, r3, init, cs, a, as, M, K, P, krot, stream, tiled",
+        py::arg("x"), py::arg("r3"), py::arg("init"), py::arg("cs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0, py::arg("v4") = 0);
+  m.def("launch_add_rms_rot_tok_split", &launch_add_rms_rot_tok_split,
+        "stream-1 split producer: y, res, w, eps, t, cs, hs, ro, a, as, scr, gamax, gcnt, M, K, P, krot, stream");
+  m.def("launch_rotate_tokquant_split", &launch_rotate_tokquant_split,
+        "split-token decode rotate+token quant: x, t, cs, a, as, scr, gamax, gcnt, M, K, P, krot, stream");
+  m.def("launch_ew_rot_tok_split", &launch_ew_rot_tok_split,
+        "split-token decode ew producer: mode, x, y, ys, w, eps, t, cs, hs, a, as, scr, gamax, gcnt, M, N, krot, stream");
+  m.def("launch_ew_rot_tok3_mr", &launch_ew_rot_tok3_mr,
+        "conflict-free multi-row launch_ew_rot_tok (byte-identical; whs=0 skips the unread HS write)",
+        py::arg("mode"), py::arg("x"), py::arg("y"), py::arg("ys"), py::arg("w"), py::arg("eps"), py::arg("r3"), py::arg("init"), py::arg("cs"), py::arg("hs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("N"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0, py::arg("whs") = 1, py::arg("v4") = 0);
+  m.def("launch_ew_rot_tok_mr", &launch_ew_rot_tok_mr,
+        "multi-row launch_ew_rot_tok (prefill band, byte-identical; whs=0 skips the unread HS write)",
+        py::arg("mode"), py::arg("x"), py::arg("y"), py::arg("ys"), py::arg("w"), py::arg("eps"), py::arg("T"), py::arg("cs"), py::arg("hs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("N"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0, py::arg("whs") = 1);
   m.def("launch_token_quant", &launch_token_quant,
         "prefill pass C: per-token scale + e4m3 encode + code row-sums (gfx1201)");
   m.def("launch_rotate_quant", &launch_rotate_quant,

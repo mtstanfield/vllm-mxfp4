@@ -1,0 +1,241 @@
+--- local/patch_paroquant_install.py.bak-20260928	2026-09-28 00:57:17.218939740 -0400
++++ local/patch_paroquant_install.py	2026-09-28 13:19:59.956519760 -0400
+@@ -34,6 +34,11 @@
+ _alt = P / "persist/paroquant/radiance_paroquant_kernel-0.29.so"
+ if any(SP.glob("vllm-0.29*")) and _alt.exists():
+     so = _alt
++# local A/B (2026-09-28): RADIANCE_LOCAL_PQ_SO=<file in persist/paroquant> overrides the kernel .so (e.g. the -mr3 build)
++_ov = os.environ.get("RADIANCE_LOCAL_PQ_SO", "")
++if _ov:
++    so = P / "persist/paroquant" / _ov
++    print(f"[local patch] paroquant install: kernel override {so}")
+ assert so.exists(), "prebuilt paroquant kernel missing: run persist/paroquant/build.sh"
+ py = P / "paroquant/radiance_paroquant.py"
+ assert py.exists(), f"missing {py}"
+@@ -91,6 +96,210 @@
+ _PQ_FP8_CFG = {"bias": None, "output_tensors": None, "target_device": None,
+                "weight": _pq_fp8_spec("fp8_e4m3", False, "per_channel", 0),
+                "input_tensors": _pq_fp8_spec("fp8_e4m3", True, "per_tensor", -1)}
++
++# ---- local patch (2026-09-28): MTP drafter linears in MXFP4 (RADIANCE_MTP_MXFP4=1) -------------------------------
++# The drafter's layer (fc + qkv/o + gate_up/down) streams ~423 MB of fp8 weights per draft pass through hipBLASLt, 4 passes
++# per decode step. Here the fp8 checkpoint weights are requantized ONCE at load to MXFP4 (e2m1 + e8m0 per 32, the scale
++# exponent picked per block from {OCP floor, floor+1} by squared error) and served by the same W4A8 kernel as the body
++# (radiance_mxfp4 ext): half the bytes. Drafts only -- the target verifies every token, so the output distribution is
++# unchanged; only acceptance can move. Quark's create_weights is kept, so loading/sharding are untouched.
++import os as _pq_os
++_PQ_MTP_MXFP4 = _pq_os.environ.get("RADIANCE_MTP_MXFP4", "0") == "1"
++# prefixes containing any of these comma-separated substrings stay fp8 (sensitivity A/Bs, e.g. "self_attn" or "fc,self_attn")
++_PQ_MTP_MXFP4_SKIP = [t for t in _pq_os.environ.get("RADIANCE_MTP_MXFP4_SKIP", "").split(",") if t]
++_PQ_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
++# RADIANCE_MTP_MXFP4_FILE=<.pt>: {vLLM prefix: {"codes": u8 [N, K/2], "e8": u8 [N, K/32]}} from mtp_gptq.py replaces the
++# load-time round-to-nearest for the prefixes it holds (shape-checked; anything else falls back to RTN).
++_PQ_MTP_MXFP4_FILE = _pq_os.environ.get("RADIANCE_MTP_MXFP4_FILE", "")
++_PQ_MTP_FILE_CACHE = {}
++
++
++def _pq_mtp_file():
++    if "d" not in _PQ_MTP_FILE_CACHE:
++        _PQ_MTP_FILE_CACHE["d"] = torch.load(_PQ_MTP_MXFP4_FILE, map_location="cpu")
++    return _PQ_MTP_FILE_CACHE["d"]
++
++
++def _pq_mxfp4_quant(w):
++    """float32 [N, K] (K % 32 == 0) -> (codes uint8 [N, K/2], e8m0 uint8 [N, K/32]); element 2i in the low nibble."""
++    N, K = w.shape
++    grid = torch.tensor(_PQ_E2M1, device=w.device)
++    codes = torch.empty((N, K // 2), dtype=torch.uint8, device=w.device)
++    scales = torch.empty((N, K // 32), dtype=torch.uint8, device=w.device)
++    rows = max(1, (1 << 27) // (K * 8))
++    for r0 in range(0, N, rows):
++        b = w[r0:r0 + rows].reshape(-1, K // 32, 32)
++        amax = b.abs().amax(-1).clamp_min(2.0 ** -120)
++        e_lo = torch.floor(torch.log2(amax)) - 2.0
++        best_err, best_idx, best_e = None, None, None
++        for de in (0.0, 1.0):
++            e = (e_lo + de).clamp(-127.0, 127.0)
++            q = b / torch.exp2(e).unsqueeze(-1)
++            idx = (q.abs().clamp(max=6.0).unsqueeze(-1) - grid).abs().argmin(-1)
++            err = ((grid[idx] * torch.sign(q) - q) * torch.exp2(e).unsqueeze(-1)).square().sum(-1)
++            if best_err is None:
++                best_err, best_idx, best_e = err, idx | ((q < 0).to(idx.dtype) << 3), e
++            else:
++                pick = err < best_err
++                best_err = torch.where(pick, err, best_err)
++                best_idx = torch.where(pick.unsqueeze(-1), idx | ((q < 0).to(idx.dtype) << 3), best_idx)
++                best_e = torch.where(pick, e, best_e)
++        nib = best_idx.reshape(b.shape[0], K).to(torch.uint8)
++        codes[r0:r0 + rows] = nib[:, 0::2] | (nib[:, 1::2] << 4)
++        scales[r0:r0 + rows] = (best_e + 127.0).to(torch.uint8)
++    return codes, scales
++
++
++def _pq_mtp_mx_linear(x: torch.Tensor, weight: torch.Tensor, ws: torch.Tensor, wref: torch.Tensor) -> torch.Tensor:
++    """One opaque op for a drafter linear: per-token fp8 quant + the W4A8 MXFP4 GEMM (x [M, K] bf16 contiguous)."""
++    import radiance_mxfp4 as _mx
++    from vllm import _custom_ops as _ops
++    M, K = x.shape
++    N = weight.shape[0]
++    out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
++    if M == 0:
++        return out
++    xq, xs = _ops.scaled_fp8_quant(x, scale=None, use_per_token_if_dynamic=True)
++    xs = xs.reshape(-1).float().contiguous()
++    _mx._ext.launch(xq.data_ptr(), weight.data_ptr(), ws.data_ptr(), wref.data_ptr(), xs.data_ptr(),
++                    out.data_ptr(), M, N, K, torch.cuda.current_stream().cuda_stream)
++    return out
++
++
++# both patched plugin modules carry this block: register once
++if _PQ_MTP_MXFP4 and not hasattr(torch.ops.radiance, "mtp_mxfp4_linear"):
++    _pq_mtp_op = torch.library.custom_op("radiance::mtp_mxfp4_linear", mutates_args=())(_pq_mtp_mx_linear)
++
++    @_pq_mtp_op.register_fake
++    def _(x, weight, ws, wref):
++        return torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=torch.bfloat16)
++
++
++class _PQMtpMXFP4Method(QuantizeMethodBase):
++    """Wraps the Quark fp8 per-channel method of one mtp.* linear: same weights at load, MXFP4 at run time."""
++    def __init__(self, inner, prefix=""):
++        self.inner = inner
++        self.prefix = prefix
++
++    def create_weights(self, layer, *args, **kwargs):
++        return self.inner.create_weights(layer, *args, **kwargs)
++
++    def process_weights_after_loading(self, layer):
++        import radiance_mxfp4 as _mx
++        w8 = layer.weight.data                                  # fp8 e4m3 [N, K], Quark has not transposed it yet
++        s = layer.weight_scale.data.float().reshape(-1)         # per output channel
++        N, K = w8.shape
++        if K % 64 or N % 16 or s.numel() != N:
++            raise RuntimeError(f"RADIANCE_MTP_MXFP4: unsupported shape N={N} K={K} scales={s.numel()}")
++        wf = w8.float() * s.unsqueeze(1)
++        codes = None
++        if _PQ_MTP_MXFP4_FILE:                                  # offline GPTQ codes (mtp_gptq.py), by vLLM prefix
++            ent = _pq_mtp_file().get(self.prefix)
++            if ent is not None and tuple(ent["codes"].shape) == (N, K // 2) and tuple(ent["e8"].shape) == (N, K // 32):
++                # the codes are only valid for the exact fp8 weights they were fitted to: check the fingerprint
++                import hashlib as _hl
++                _h = _hl.sha1(w8.contiguous().view(torch.uint8).cpu().numpy().tobytes())
++                _h.update(s.float().contiguous().cpu().numpy().tobytes())
++                if ent.get("src_sha1") == _h.hexdigest():
++                    codes, e8, src = ent["codes"].to(wf.device), ent["e8"].to(wf.device), "gptq"
++                else:
++                    import sys as _s
++                    _s.stderr.write(f"[radiance.mtp_mxfp4] {self.prefix}: {_PQ_MTP_MXFP4_FILE} was fitted to other weights "
++                                    f"(fingerprint mismatch) -- using load-time RTN" + chr(10))
++        if codes is None:
++            codes, e8 = _pq_mxfp4_quant(wf)
++            src = "rtn"
++        # load-time report: weight error of the requantization, and the kernel against the dequantized weight
++        lut = torch.tensor(_PQ_E2M1 + tuple(-v for v in _PQ_E2M1), device=wf.device)
++        deq = lut[torch.stack([codes & 15, codes >> 4], -1).reshape(N, K).long()] \
++            * torch.exp2(e8.float() - 127.0).repeat_interleave(32, dim=1)
++        rel_w = float((deq - wf).norm() / wf.norm().clamp_min(1e-12))
++        ws_t = e8.t().contiguous()
++        wk = _mx.permute_w(codes, N, K) if _mx.WPERM else codes
++        wref = _mx.make_row_ref(ws_t)
++        for name in ("weight", "weight_scale", "input_scale"):
++            if hasattr(layer, name):
++                delattr(layer, name)
++        layer.weight = torch.nn.Parameter(wk.contiguous(), requires_grad=False)
++        layer.mx_ws = torch.nn.Parameter(ws_t, requires_grad=False)
++        layer.mx_ref = torch.nn.Parameter(wref, requires_grad=False)
++        x = torch.randn(4, K, device=wf.device, dtype=torch.bfloat16)
++        ref = x.float() @ deq.t()
++        got = self._run(layer, x).float()
++        rel_k = float((got - ref).norm() / ref.norm().clamp_min(1e-12))
++        import sys as _s
++        _s.stderr.write(f"[radiance.mtp_mxfp4] {self.prefix} {N}x{K} ({src}): weight relerr vs fp8 {rel_w:.4f}, kernel vs dequant "
++                        f"{rel_k:.4f}, {w8.numel() >> 20} MiB fp8 -> {(wk.numel() + ws_t.numel()) >> 20} MiB" + chr(10))
++
++    @staticmethod
++    def _run(layer, x2):
++        return torch.ops.radiance.mtp_mxfp4_linear(x2, layer.weight, layer.mx_ws, layer.mx_ref)
++
++    def apply(self, layer, x, bias=None):
++        out = self._run(layer, x.reshape(-1, x.shape[-1]).contiguous())
++        if x.dim() != 2:
++            out = out.view(*x.shape[:-1], out.shape[-1])
++        return out + bias if bias is not None else out
++
++
++# ---- local patch (2026-09-28): drafter input statistics for an offline GPTQ requant (RADIANCE_MTP_HCOLLECT=<dir>) ------
++# Calibration run only, with --enforce-eager (the flag polling below is plain Python). The fp8 drafter runs unchanged;
++# every mtp.* linear also accumulates its input second moment H = sum x^T x in fp32, split by call width (M <= 16 = the
++# draft passes, else the drafter's prefill over prompt tokens). Accumulates while <dir>/ON exists; creating <dir>/SAVE
++# writes <dir>/<prefix>.pt = {Hd, nd, Hp, np, w8, scale} and removes SAVE. mtp_gptq.py turns those into MXFP4 codes.
++_PQ_MTP_HC = _pq_os.environ.get("RADIANCE_MTP_HCOLLECT", "")
++
++
++class _PQMtpHCollect(QuantizeMethodBase):
++    _all = []
++    _state = {"calls": 0, "on": False}
++
++    def __init__(self, inner, prefix=""):
++        self.inner = inner
++        self.prefix = prefix
++
++    def create_weights(self, layer, *args, **kwargs):
++        return self.inner.create_weights(layer, *args, **kwargs)
++
++    def process_weights_after_loading(self, layer):
++        self.w8 = layer.weight.data.clone().cpu()                         # fp8 [N, K] as loaded (before Quark's transpose)
++        self.scale = layer.weight_scale.data.float().reshape(-1).clone().cpu()
++        K = self.w8.shape[1]
++        self.inner.process_weights_after_loading(layer)
++        dev = layer.weight.device
++        self.hd = torch.zeros(K, K, dtype=torch.float32, device=dev)
++        self.hp = torch.zeros(K, K, dtype=torch.float32, device=dev)
++        self.nd = self.np_ = 0
++        _PQMtpHCollect._all.append(self)
++        import sys as _s
++        _s.stderr.write(f"[radiance.mtp_hcollect] {self.prefix} {tuple(self.w8.shape)}: collecting into {_PQ_MTP_HC}" + chr(10))
++
++    @classmethod
++    def _poll(cls):
++        st = cls._state
++        st["on"] = _pq_os.path.exists(_pq_os.path.join(_PQ_MTP_HC, "ON"))
++        sv = _pq_os.path.join(_PQ_MTP_HC, "SAVE")
++        if _pq_os.path.exists(sv):
++            torch.cuda.synchronize()
++            for m in cls._all:
++                torch.save({"Hd": m.hd.cpu(), "nd": m.nd, "Hp": m.hp.cpu(), "np": m.np_, "w8": m.w8, "scale": m.scale},
++                           _pq_os.path.join(_PQ_MTP_HC, m.prefix + ".pt"))
++            with open(_pq_os.path.join(_PQ_MTP_HC, "SAVED"), "w") as f:
++                f.write(" ".join(f"{m.prefix}:{m.nd}/{m.np_}" for m in cls._all) + chr(10))
++            _pq_os.remove(sv)
++
++    def apply(self, layer, x, bias=None):
++        st = _PQMtpHCollect._state
++        st["calls"] += 1
++        if st["calls"] % 32 == 0:
++            _PQMtpHCollect._poll()
++        if st["on"]:
++            x2 = x.reshape(-1, x.shape[-1]).float()
++            if x2.shape[0] <= 16:
++                self.hd.addmm_(x2.t(), x2); self.nd += x2.shape[0]
++            else:
++                self.hp.addmm_(x2.t(), x2); self.np_ += x2.shape[0]
++        return self.inner.apply(layer, x, bias)
+ # --------------------------------------------------------------------------------------------------
+ 
+ '''
+@@ -179,7 +388,14 @@
+         if self.quark_config is not None and not any(_fnmatch.fnmatchcase(prefix, p) for p in self.pq_layers):
+             return self._quark_full().get_quant_method(layer, prefix)   # local patch (mixed)
+         if self.fp8_heads and any(_fnmatch.fnmatchcase(prefix, p) for p in self.fp8_heads):
+-            return self._quark_heads().get_quant_method(layer, prefix)   # local patch: fp8 heads
++            _qm = self._quark_heads().get_quant_method(layer, prefix)   # local patch: fp8 heads
++            # every LinearBase the fp8-heads patterns reach is a drafter linear (the LM heads are ParallelLMHead)
++            if _PQ_MTP_HC and _qm is not None and isinstance(layer, LinearBase):
++                return _PQMtpHCollect(_qm, prefix)   # local patch (2026-09-28): drafter H collection (calibration run)
++            if _PQ_MTP_MXFP4 and _qm is not None and isinstance(layer, LinearBase) \\
++                    and not any(t in prefix for t in _PQ_MTP_MXFP4_SKIP):
++                return _PQMtpMXFP4Method(_qm, prefix)   # local patch (2026-09-28): drafter linears in MXFP4
++            return _qm
+         if self.body_config is not None and any(_fnmatch.fnmatchcase(prefix, p) for p in self.body_layers) and not any(_fnmatch.fnmatchcase(prefix, p) for p in self.pq_layers):
+             return self._body().get_quant_method(layer, prefix)   # local patch (3-way): rotation-MXFP4 body
+         if not isinstance(layer, LinearBase):
