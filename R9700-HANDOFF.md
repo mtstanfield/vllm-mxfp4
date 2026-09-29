@@ -78,6 +78,15 @@ The TunableOp table goes to `$CACHE/tunableop/skinny0.csv`. Its validators inclu
 owner's image it applies as-is; with a self-built image it may be silently ignored (defaults return, ~5% slower sampled decode).
 Re-tune with `r9700/review-20260927/fp8_tune.py` in that case.
 
+## Host prerequisites
+
+- Linux with the in-kernel `amdgpu` driver for gfx1201 (`/dev/kfd` and `/dev/dri` present). The owner's host runs kernel 6.18 with
+  MES firmware 0x8b, the version that fixes RDNA4's stuck-at-100%-busy after compute. ROCm itself lives in the image; the host
+  needs no ROCm install.
+- Docker, and `python3` on the host (the fork's `serve-mxfp4.sh` uses it). About 2 GiB of free RAM per server for the
+  offloaded vision tower and embedding table, plus ~20 GB of disk for the image and checkpoint.
+- The `hf` CLI (`pip install -U huggingface_hub`) for the downloads; no Hugging Face account needed, all repos are public.
+
 ## Reproduce one card first
 
 1. Load the image, put the checkpoint, drafter file, kernels and TunableOp table in place, fix the paths.
